@@ -212,33 +212,67 @@ export class GladiaClient {
 
   /**
    * 녹음 중단 요청 → 후처리(요약) 트리거
-   * stop_recording 을 보내면 Gladia가 후처리를 시작하고,
-   * 완료되면 WebSocket을 code 1000 으로 닫는다.
+   * stop_recording 을 보내면 Gladia가 후처리를 시작한다.
+   * 
+   * 주의: Gladia는 stop_recording 후 ~3초 만에 WebSocket을 code 1000으로 닫으며,
+   * post_processing(요약) 이벤트가 도착하기 전에 연결이 끊길 수 있다.
+   * 따라서 post_processing 이벤트를 우선 기다리되, WS가 먼저 닫히면
+   * summaryReceived 플래그를 통해 호출부에서 REST 폴백 여부를 판단한다.
    */
   stopRecording() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.warn('[Gladia] WebSocket이 열려있지 않습니다.');
-      return Promise.resolve(this.sessionId);
+      return Promise.resolve({ sessionId: this.sessionId, summaryReceived: false });
     }
 
     console.log('[Gladia] 녹음 중단 요청 전송...');
-    this._stopKeepAlive(); // stop_recording 후 무음 패킷 전송 중단
+    this._stopKeepAlive();
     this.ws.send(JSON.stringify({ type: 'stop_recording' }));
 
     return new Promise((resolve) => {
+      let resolved = false;
+      let summaryReceived = false;
+
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve({ sessionId: this.sessionId, summaryReceived });
+      };
+
+      // post_processing(요약) 수신 시 플래그 설정 후 resolve
+      const originalOnSummary = this.onSummary;
+      this.onSummary = (summary) => {
+        summaryReceived = true;
+        originalOnSummary(summary);
+        console.log('[Gladia] 요약 수신 완료, stopRecording resolve');
+        done();
+      };
+
+      // lifecycle done 이벤트
       const originalOnEnd = this.onSessionEnd;
       this.onSessionEnd = (sessionId) => {
         originalOnEnd(sessionId);
-        resolve(sessionId);
+        // lifecycle done 후 잠시 대기 (요약이 바로 뒤에 올 수 있음)
+        setTimeout(() => done(), 2000);
       };
 
-      // 안전장치: WebSocket close 이벤트로도 resolve
+      // WebSocket close → 요약이 아직 안 왔으면 2초 더 대기 후 resolve
       if (this.ws) {
-        this.ws.on('close', () => resolve(this.sessionId));
+        this.ws.on('close', () => {
+          console.log('[Gladia] WS 종료됨, 요약 수신 여부:', summaryReceived);
+          if (!summaryReceived) {
+            setTimeout(() => done(), 2000);
+          }
+        });
       }
 
-      // 타임아웃 안전장치 (60초)
-      setTimeout(() => resolve(this.sessionId), 60000);
+      // 타임아웃 안전장치 (30초)
+      setTimeout(() => {
+        if (!resolved) {
+          console.warn('[Gladia] stopRecording 타임아웃 (30초)');
+          done();
+        }
+      }, 30000);
     });
   }
 

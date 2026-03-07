@@ -181,18 +181,41 @@ async function stopMeeting(interaction) {
 
     // 1. 먼저 Gladia에 stop_recording 전송 (후처리 트리거)
     //    이때 아직 voice는 살아있어서 마지막 버퍼가 전송될 수 있음
-    await session.gladiaClient.stopRecording();
+    const stopResult = await session.gladiaClient.stopRecording();
 
     // 2. 음성 스트림 중단
     session.voiceHandler.destroy();
 
-    // 3. 잠시 대기 (요약 수신 여유)
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    // 3. WebSocket으로 요약이 수신되지 않았으면 REST API로 폴백 조회
+    let summary = session.getSummary();
 
-    // 4. 통계 및 전사록 먼저 수집 (destroy 전에)
+    if (!summary && stopResult && !stopResult.summaryReceived) {
+      console.log('[Main] WebSocket으로 요약 미수신, REST API 폴백 시도...');
+
+      // Gladia 후처리 완료까지 폴링 (최대 3회, 10초 간격)
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+        console.log(`[Main] REST API 요약 조회 시도 ${attempt}/3...`);
+
+        try {
+          const results = await session.gladiaClient.getSessionResults();
+
+          if (results?.post_processing?.summarization) {
+            summary = results.post_processing.summarization;
+            console.log('[Main] REST API로 요약 획득 성공');
+            break;
+          } else {
+            console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt})`);
+          }
+        } catch (err) {
+          console.error(`[Main] REST API 요약 조회 실패 (attempt ${attempt}):`, err.message);
+        }
+      }
+    }
+
+    // 4. 통계 및 전사록 수집 (destroy 전에)
     const stats = session.transcriptManager.getStats();
     const fullTranscript = session.transcriptManager.getFullTranscript();
-    const summary = session.getSummary();
 
     // 5. 전사 매니저 정리 (남은 버퍼 전송)
     session.transcriptManager.destroy();

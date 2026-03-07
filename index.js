@@ -8,7 +8,8 @@
  *  /meeting-stop   : 전사 중단 + 요약 노트 생성
  *  /meeting-status : 현재 세션 상태 확인
  */
-import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags, Events } from 'discord.js';
+import { generateDependencyReport } from '@discordjs/voice';
 import config from './src/config.js';
 import { VoiceHandler } from './src/voiceHandler.js';
 import { GladiaClient } from './src/gladiaClient.js';
@@ -250,9 +251,12 @@ async function checkStatus(interaction) {
 
 // ── 이벤트 핸들러 ──
 
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
   console.log(`✅ 봇 로그인 완료: ${client.user.tag}`);
   console.log(`   서버 수: ${client.guilds.cache.size}`);
+  console.log(`   Node.js: ${process.version}`);
+  // 의존성 보고서 출력 (디버깅용)
+  console.log('[Dependencies]\n' + generateDependencyReport());
 });
 
 client.on('interactionCreate', async (interaction) => {

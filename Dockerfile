@@ -1,6 +1,6 @@
-FROM node:20-slim
+FROM node:22-slim
 
-# ffmpeg만 필요 (네이티브 빌드 불필요 - opusscript/libsodium-wrappers 사용)
+# ffmpeg 필요 + @snazzah/davey 네이티브 바이너리 지원
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*

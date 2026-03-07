@@ -4,7 +4,6 @@ import {
   entersState,
   EndBehaviorType,
 } from '@discordjs/voice';
-import { Transform } from 'stream';
 import prism from 'prism-media';
 
 /**
@@ -13,6 +12,9 @@ import prism from 'prism-media';
  * - 유저별 오디오 스트림 수신 (Opus → PCM 변환)
  * - 모노 믹스다운 후 Gladia 로 단일 채널 전송
  *   (Gladia 내장 diarization 이 화자 구분 담당)
+ *
+ * NOTE: Discord DAVE (E2EE) 프로토콜 지원 (2026.03.02 이후 필수)
+ *       @snazzah/davey 패키지가 node_modules에 있으면 자동으로 DAVE 활성화됨
  */
 export class VoiceHandler {
   constructor({ onAudioData, onUserJoin, onUserLeave }) {
@@ -31,35 +33,63 @@ export class VoiceHandler {
 
   /**
    * 음성 채널 접속
+   * DAVE 프로토콜을 비활성화하여 오디오 수신 안정성 확보
+   * (DAVE enabled 상태에서는 수신 오디오 복호화 문제 있음 - discordjs #11419)
    */
   async join(voiceChannel) {
+    console.log(`[Voice] 음성 채널 접속 시도: ${voiceChannel.name} (${voiceChannel.id})`);
+    console.log(`[Voice] 길드: ${voiceChannel.guild.name} (${voiceChannel.guild.id})`);
+
     this.connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: voiceChannel.guild.id,
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
       selfDeaf: false,  // 봇이 오디오를 수신해야 하므로 deaf 해제
       selfMute: true,   // 봇은 말하지 않음
+      // DAVE E2EE 비활성화 - 오디오 수신(receive) 시 복호화 문제 회피
+      // @discordjs/voice 0.19.0 에서 DAVE 수신 측 버그로 인해 비활성화
+      daveEncryption: false,
+      // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비
+      decryptionFailureTolerance: 10,
     });
 
-    // 연결 완료 대기
+    // 연결 상태 변화 디버깅 로그
+    this.connection.on('stateChange', (oldState, newState) => {
+      console.log(`[Voice] 연결 상태 변경: ${oldState.status} → ${newState.status}`);
+    });
+
+    // 연결 에러 로깅
+    this.connection.on('error', (err) => {
+      console.error('[Voice] 연결 오류:', err.message);
+    });
+
+    // 연결 완료 대기 (30초 타임아웃 - DAVE 핸드셰이크 포함)
     try {
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
       console.log(`[Voice] 음성 채널 접속 완료: ${voiceChannel.name}`);
     } catch (err) {
-      this.connection.destroy();
+      console.error(`[Voice] 연결 실패 상세:`, err);
+      // 연결 상태 로깅
+      if (this.connection) {
+        console.error(`[Voice] 현재 연결 상태: ${this.connection.state.status}`);
+      }
+      this.connection?.destroy();
       this.connection = null;
       throw new Error(`음성 채널 연결 실패: ${err.message}`);
     }
 
-    // 연결 상태 모니터링
+    // 연결 상태 모니터링 (끊김 → 재연결 시도)
     this.connection.on(VoiceConnectionStatus.Disconnected, async () => {
       if (this.destroyed) return;
+      console.log('[Voice] 연결 끊김 감지, 재연결 시도...');
       try {
         await Promise.race([
           entersState(this.connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(this.connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
+        console.log('[Voice] 재연결 진행 중...');
       } catch {
+        console.log('[Voice] 재연결 실패, 정리 중...');
         if (!this.destroyed) this.destroy();
       }
     });
@@ -67,6 +97,7 @@ export class VoiceHandler {
     // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
     this.connection.receiver.speaking.on('start', (userId) => {
       if (!this.activeStreams.has(userId) && !this.destroyed) {
+        console.log(`[Voice] 유저 스피킹 감지: ${userId}`);
         this._subscribeUser(userId);
       }
     });

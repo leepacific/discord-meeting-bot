@@ -192,20 +192,22 @@ async function stopMeeting(interaction) {
     if (!summary && stopResult && !stopResult.summaryReceived) {
       console.log('[Main] WebSocket으로 요약 미수신, REST API 폴백 시도...');
 
-      // Gladia 후처리 완료까지 폴링 (최대 3회, 10초 간격)
+      // Gladia 후처리 완료까지 폴링 (최대 3회, 5초 간격)
       for (let attempt = 1; attempt <= 3; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 10000));
+        await new Promise((resolve) => setTimeout(resolve, 5000));
         console.log(`[Main] REST API 요약 조회 시도 ${attempt}/3...`);
 
         try {
           const results = await session.gladiaClient.getSessionResults();
 
-          if (results?.post_processing?.summarization) {
-            summary = results.post_processing.summarization;
+          // REST API 응답 구조: result.summarization (post_processing 아님)
+          const summaryData = results?.result?.summarization;
+          if (summaryData && summaryData.success && !summaryData.is_empty) {
+            summary = summaryData;
             console.log('[Main] REST API로 요약 획득 성공');
             break;
           } else {
-            console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt})`);
+            console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt}), status: ${results?.status}, summarization: ${JSON.stringify(summaryData?.success ?? null)}`);
           }
         } catch (err) {
           console.error(`[Main] REST API 요약 조회 실패 (attempt ${attempt}):`, err.message);

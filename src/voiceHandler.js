@@ -52,7 +52,7 @@ export class VoiceHandler {
       daveEncryption: true,
       // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비
       decryptionFailureTolerance: 100,
-      debug: false,
+      debug: true,
     });
 
     // 연결 상태 변화 로그 (핵심 상태만)
@@ -63,6 +63,14 @@ export class VoiceHandler {
     // 연결 에러 로깅
     this.connection.on('error', (err) => {
       console.error('[Voice] 연결 오류:', err.message);
+    });
+
+    // 디버그 로그 (DAVE 핸드셰이크, 복호화 상태 확인용)
+    this.connection.on('debug', (msg) => {
+      // DAVE/복호화 관련 메시지만 필터링
+      if (msg.includes('decrypt') || msg.includes('DAVE') || msg.includes('dave') || msg.includes('packet')) {
+        console.log(`[Voice:debug] ${msg}`);
+      }
     });
 
     // 연결 완료 대기 (45초 타임아웃 - DAVE 핸드셰이크 포함)
@@ -99,11 +107,21 @@ export class VoiceHandler {
       }
     });
 
+    // SSRC 맵 업데이트 모니터링 (화자 정보 수신 확인)
+    this.connection.receiver.ssrcMap.on('update', (data) => {
+      console.log(`[Voice] SSRC 맵 업데이트:`, JSON.stringify(data));
+    });
+
     // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
     this.connection.receiver.speaking.on('start', (userId) => {
+      console.log(`[Voice] 스피킹 감지: ${userId}`);
       if (!this.activeStreams.has(userId) && !this.destroyed) {
         this._subscribeUser(userId);
       }
+    });
+
+    this.connection.receiver.speaking.on('end', (userId) => {
+      console.log(`[Voice] 스피킹 종료: ${userId}`);
     });
 
     // 주기적으로 오디오 믹싱 및 전송

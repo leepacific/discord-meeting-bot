@@ -113,6 +113,9 @@ export class VoiceHandler {
       console.log(`[Voice] SSRC 맵 업데이트:`, JSON.stringify(data));
     });
 
+    // UDP 패킷 수신 모니터링 (진단용)
+    this._monitorUdpPackets();
+
     // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
     this.connection.receiver.speaking.on('start', (userId) => {
       console.log(`[Voice] 스피킹 감지: ${userId}`);
@@ -132,6 +135,47 @@ export class VoiceHandler {
     this._startInactivityCleanup();
 
     return this.connection;
+  }
+
+  /**
+   * UDP 패킷 수신 모니터링 (진단용)
+   */
+  _monitorUdpPackets() {
+    let udpCount = 0;
+    let lastLog = Date.now();
+    let monitorAttached = false;
+
+    const tryAttach = () => {
+      if (monitorAttached || this.destroyed || !this.connection) return;
+
+      const state = this.connection.state;
+      if (state.status === 'ready' && state.networking) {
+        const netState = state.networking.state;
+        if (netState.code >= 2 && netState.udp) {
+          try {
+            const udpSocket = netState.udp;
+            if (udpSocket && udpSocket.socket) {
+              udpSocket.socket.on('message', () => {
+                udpCount++;
+                const now = Date.now();
+                if (now - lastLog > 5000) {
+                  console.log(`[Voice] UDP 패킷: ${udpCount}개/5초, SSRC맵: ${this.connection?.receiver?.ssrcMap?.map?.size ?? '?'}, 스트림: ${this.activeStreams.size}`);
+                  udpCount = 0;
+                  lastLog = now;
+                }
+              });
+              monitorAttached = true;
+              console.log('[Voice] UDP 모니터링 시작');
+            }
+          } catch (e) {
+            console.log('[Voice] UDP 모니터링 실패:', e.message);
+          }
+        }
+      }
+    };
+
+    this.connection.on('stateChange', () => tryAttach());
+    tryAttach();
   }
 
   /**

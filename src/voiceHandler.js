@@ -29,16 +29,18 @@ export class VoiceHandler {
     this.mixInterval = null;
     this.userBuffers = new Map();     // userId → [PCM 16kHz mono chunks]
     this.destroyed = false;
+
+    // 메모리 관리: 비활성 유저 스트림 정리 타이머
+    this.inactivityCleanupInterval = null;
+    this.userLastActive = new Map();  // userId → timestamp
   }
 
   /**
    * 음성 채널 접속
-   * DAVE 프로토콜을 비활성화하여 오디오 수신 안정성 확보
-   * (DAVE enabled 상태에서는 수신 오디오 복호화 문제 있음 - discordjs #11419)
+   * DAVE E2EE 프로토콜 활성화 (2026.03.02 이후 Discord 필수 요구사항)
    */
   async join(voiceChannel) {
     console.log(`[Voice] 음성 채널 접속 시도: ${voiceChannel.name} (${voiceChannel.id})`);
-    console.log(`[Voice] 길드: ${voiceChannel.guild.name} (${voiceChannel.guild.id})`);
 
     this.connection = joinVoiceChannel({
       channelId: voiceChannel.id,
@@ -46,17 +48,16 @@ export class VoiceHandler {
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
       selfDeaf: false,  // 봇이 오디오를 수신해야 하므로 deaf 해제
       selfMute: true,   // 봇은 말하지 않음
-      // DAVE E2EE 활성화 (2026.03.02 이후 Discord 필수 요구사항)
-      // @snazzah/davey가 node_modules에 있으면 자동으로 DAVE 핸드셰이크 처리
+      // DAVE E2EE 활성화 (@snazzah/davey가 자동으로 핸드셰이크 처리)
       daveEncryption: true,
-      // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비 (높게 설정)
+      // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비
       decryptionFailureTolerance: 100,
-      debug: true,
+      debug: false,
     });
 
-    // 연결 상태 변화 디버깅 로그
+    // 연결 상태 변화 로그 (핵심 상태만)
     this.connection.on('stateChange', (oldState, newState) => {
-      console.log(`[Voice] 연결 상태 변경: ${oldState.status} → ${newState.status}`);
+      console.log(`[Voice] 연결 상태: ${oldState.status} → ${newState.status}`);
     });
 
     // 연결 에러 로깅
@@ -64,111 +65,54 @@ export class VoiceHandler {
       console.error('[Voice] 연결 오류:', err.message);
     });
 
-    // 디버그 로그 수신
-    this.connection.on('debug', (msg) => {
-      console.log(`[Voice:debug] ${msg}`);
-    });
-
     // 연결 완료 대기 (45초 타임아웃 - DAVE 핸드셰이크 포함)
     try {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 45_000);
       console.log(`[Voice] 음성 채널 접속 완료: ${voiceChannel.name}`);
     } catch (err) {
-      console.error(`[Voice] 연결 실패 상세:`, err);
-      // 연결 상태 로깅
-      if (this.connection) {
-        console.error(`[Voice] 현재 연결 상태: ${this.connection.state.status}`);
-      }
+      console.error(`[Voice] 연결 실패:`, err.message);
       this.connection?.destroy();
       this.connection = null;
       throw new Error(`음성 채널 연결 실패: ${err.message}`);
     }
 
-    // 연결 상태 모니터링 (끊김 → 재연결 시도)
+    // 연결 끊김 감지 → 재연결 시도
+    // Discord가 자동으로 Signalling/Connecting 상태로 전환하면 Ready까지 대기
+    // 전환하지 않으면 (5초 타임아웃) 정리
     this.connection.on(VoiceConnectionStatus.Disconnected, async () => {
       if (this.destroyed) return;
-      console.log('[Voice] 연결 끊김 감지, 재연결 시도...');
+      console.log('[Voice] 연결 끊김 감지, 재연결 대기...');
+
       try {
+        // Discord 라이브러리가 자동으로 Signalling/Connecting으로 전환하는지 확인
         await Promise.race([
           entersState(this.connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(this.connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
         console.log('[Voice] 재연결 진행 중...');
+        // Ready 상태까지 대기 (DAVE 핸드셰이크 포함 최대 45초)
+        await entersState(this.connection, VoiceConnectionStatus.Ready, 45_000);
+        console.log('[Voice] 재연결 성공');
       } catch {
         console.log('[Voice] 재연결 실패, 정리 중...');
         if (!this.destroyed) this.destroy();
       }
     });
 
-    // SSRC 맵 변경 모니터링 (화자 정보 수신 확인)
-    this.connection.receiver.ssrcMap.on('update', (data) => {
-      console.log(`[Voice] SSRC 맵 업데이트:`, JSON.stringify(data));
-    });
-
-    // UDP 패킷 수신 여부 확인용 - networking 상태에서 직접 UDP 소켓 감시
-    this._monitorUdpPackets();
-
     // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
     this.connection.receiver.speaking.on('start', (userId) => {
       if (!this.activeStreams.has(userId) && !this.destroyed) {
-        console.log(`[Voice] 유저 스피킹 감지: ${userId}`);
         this._subscribeUser(userId);
       }
-    });
-
-    this.connection.receiver.speaking.on('end', (userId) => {
-      console.log(`[Voice] 유저 스피킹 종료: ${userId}`);
     });
 
     // 주기적으로 오디오 믹싱 및 전송
     this._startMixing();
 
+    // 비활성 유저 스트림 정리 타이머 (메모리 누수 방지)
+    this._startInactivityCleanup();
+
     return this.connection;
-  }
-
-  /**
-   * UDP 패킷 수신 모니터링 (디버깅용)
-   */
-  _monitorUdpPackets() {
-    let udpCount = 0;
-    let lastLog = Date.now();
-    let monitorAttached = false;
-
-    const tryAttach = () => {
-      if (monitorAttached || this.destroyed || !this.connection) return;
-
-      const state = this.connection.state;
-      if (state.status === 'ready' && state.networking) {
-        const netState = state.networking.state;
-        // networking state code 4 = Ready
-        if (netState.code >= 2 && netState.udp) {
-          try {
-            // UDP socket의 내부 socket에 접근
-            const udpSocket = netState.udp;
-            if (udpSocket && udpSocket.socket) {
-              udpSocket.socket.on('message', () => {
-                udpCount++;
-                const now = Date.now();
-                if (now - lastLog > 5000) {
-                  console.log(`[Voice] UDP raw 패킷: ${udpCount}개 (최근 5초), SSRC맵 크기: ${this.connection?.receiver?.ssrcMap?.map?.size ?? '?'}`);
-                  udpCount = 0;
-                  lastLog = now;
-                }
-              });
-              monitorAttached = true;
-              console.log('[Voice] UDP 소켓 모니터링 시작');
-            }
-          } catch (e) {
-            console.log('[Voice] UDP 소켓 모니터링 실패:', e.message);
-          }
-        }
-      }
-    };
-
-    // 연결 상태 변경 시 시도
-    this.connection.on('stateChange', () => tryAttach());
-    // 즉시 시도
-    tryAttach();
   }
 
   /**
@@ -184,10 +128,11 @@ export class VoiceHandler {
       this.onUserJoin(userId, this.userChannelMap.get(userId));
     }
 
-    // 이미 버퍼가 없으면 생성
+    // 버퍼 초기화
     if (!this.userBuffers.has(userId)) {
       this.userBuffers.set(userId, []);
     }
+    this.userLastActive.set(userId, Date.now());
 
     const opusStream = this.connection.receiver.subscribe(userId, {
       end: {
@@ -197,7 +142,6 @@ export class VoiceHandler {
     });
 
     // prism-media Opus 디코더: Opus → PCM 48kHz stereo
-    // prism-media는 @discordjs/opus 또는 opusscript 를 자동으로 감지하여 사용
     const decoder = new prism.opus.Decoder({
       rate: 48000,
       channels: 2,
@@ -211,8 +155,11 @@ export class VoiceHandler {
         // 48kHz stereo → 16kHz mono 다운샘플링
         const pcm16kMono = this._downsample(pcm48kStereo, 48000, 2, 16000);
         const buf = this.userBuffers.get(userId);
-        if (buf) buf.push(pcm16kMono);
-      } catch (err) {
+        if (buf) {
+          buf.push(pcm16kMono);
+          this.userLastActive.set(userId, Date.now());
+        }
+      } catch {
         // 변환 실패 무시
       }
     });
@@ -288,6 +235,35 @@ export class VoiceHandler {
   }
 
   /**
+   * 비활성 유저 스트림 정리 (메모리 누수 방지)
+   * 5분 이상 오디오 데이터가 없는 유저의 버퍼를 정리
+   */
+  _startInactivityCleanup() {
+    const CLEANUP_INTERVAL_MS = 60_000;       // 1분마다 체크
+    const INACTIVITY_THRESHOLD_MS = 300_000;  // 5분 비활성
+
+    this.inactivityCleanupInterval = setInterval(() => {
+      if (this.destroyed) return;
+      const now = Date.now();
+
+      for (const [userId, lastActive] of this.userLastActive) {
+        if (now - lastActive > INACTIVITY_THRESHOLD_MS) {
+          // 스트림 정리
+          const stream = this.activeStreams.get(userId);
+          if (stream) {
+            try { stream.cleanup(); } catch {}
+            this.activeStreams.delete(userId);
+          }
+          // 버퍼 정리
+          this.userBuffers.delete(userId);
+          this.userLastActive.delete(userId);
+          console.log(`[Voice] 비활성 유저 정리: ${userId}`);
+        }
+      }
+    }, CLEANUP_INTERVAL_MS);
+  }
+
+  /**
    * 현재 참가 유저 수
    */
   get userCount() {
@@ -306,11 +282,17 @@ export class VoiceHandler {
       this.mixInterval = null;
     }
 
+    if (this.inactivityCleanupInterval) {
+      clearInterval(this.inactivityCleanupInterval);
+      this.inactivityCleanupInterval = null;
+    }
+
     for (const [, { cleanup }] of this.activeStreams) {
       try { cleanup(); } catch {}
     }
     this.activeStreams.clear();
     this.userBuffers.clear();
+    this.userLastActive.clear();
 
     if (this.connection) {
       try { this.connection.destroy(); } catch {}

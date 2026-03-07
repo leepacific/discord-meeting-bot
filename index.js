@@ -26,8 +26,8 @@ const client = new Client({
   ],
 });
 
-// ── 서버(길드)별 활성 세션 관리 ──
-const activeSessions = new Map(); // guildId → session
+// ── 채널별 활성 세션 관리 (서버 내 다중 채널 동시 지원) ──
+const activeSessions = new Map(); // channelId → session
 
 /**
  * 회의 세션 시작
@@ -35,15 +35,6 @@ const activeSessions = new Map(); // guildId → session
 async function startMeeting(interaction) {
   const guild = interaction.guild;
   const member = interaction.member;
-
-  // 이미 진행 중인 세션 확인
-  if (activeSessions.has(guild.id)) {
-    await interaction.reply({
-      content: '⚠️ 이미 회의 기록이 진행 중입니다. `/meeting-stop`으로 먼저 종료해주세요.',
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
 
   // 유저가 음성 채널에 있는지 확인
   const voiceChannel = member.voice.channel;
@@ -55,18 +46,32 @@ async function startMeeting(interaction) {
     return;
   }
 
+  // 해당 채널에서 이미 진행 중인 세션 확인
+  if (activeSessions.has(voiceChannel.id)) {
+    await interaction.reply({
+      content: '⚠️ 이 음성 채널에서 이미 회의 기록이 진행 중입니다. `/meeting-stop`으로 먼저 종료해주세요.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   await interaction.deferReply();
+
+  // try 블록 밖에 선언하여 catch에서도 접근 가능하도록 함
+  let voiceHandler = null;
+  let gladiaClient = null;
+  let transcriptManager = null;
 
   try {
     // 전사 매니저 초기화
-    const transcriptManager = new TranscriptManager();
+    transcriptManager = new TranscriptManager();
     transcriptManager.start(interaction.channel);
 
     // Gladia 요약 결과를 저장할 변수
     let gladiaSummary = null;
 
     // Gladia 클라이언트 초기화
-    const gladiaClient = new GladiaClient({
+    gladiaClient = new GladiaClient({
       onTranscript: (data) => {
         transcriptManager.addTranscript(data);
       },
@@ -83,7 +88,7 @@ async function startMeeting(interaction) {
     });
 
     // Voice 핸들러 초기화
-    const voiceHandler = new VoiceHandler({
+    voiceHandler = new VoiceHandler({
       onAudioData: (audioBuffer) => {
         gladiaClient.sendAudio(audioBuffer);
       },
@@ -122,7 +127,7 @@ async function startMeeting(interaction) {
       startedAt: new Date(),
       getSummary: () => gladiaSummary,
     };
-    activeSessions.set(guild.id, session);
+    activeSessions.set(voiceChannel.id, session);
 
     // 시작 알림 임베드
     const startEmbed = new EmbedBuilder()
@@ -140,11 +145,11 @@ async function startMeeting(interaction) {
 
   } catch (err) {
     console.error('[Main] 회의 시작 실패:', err);
-    // 실패 시 모든 리소스 정리 (activeSessions에 저장 전이라도)
+    // 실패 시 모든 리소스 정리
     try { voiceHandler?.destroy(); } catch {}
     try { gladiaClient?.destroy(); } catch {}
     try { transcriptManager?.destroy(); } catch {}
-    activeSessions.delete(guild.id);
+    activeSessions.delete(voiceChannel.id);
     await interaction.editReply({
       content: `❌ 회의 시작 실패: ${err.message}`,
     });
@@ -156,11 +161,14 @@ async function startMeeting(interaction) {
  */
 async function stopMeeting(interaction) {
   const guild = interaction.guild;
-  const session = activeSessions.get(guild.id);
+  const member = interaction.member;
+
+  // 유저가 접속한 음성 채널의 세션을 찾거나, 서버 내 세션 검색
+  const session = findSession(member, guild);
 
   if (!session) {
     await interaction.reply({
-      content: '⚠️ 현재 진행 중인 회의가 없습니다.',
+      content: '⚠️ 현재 진행 중인 회의가 없습니다. 음성 채널에 접속한 상태에서 실행해주세요.',
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -201,7 +209,7 @@ async function stopMeeting(interaction) {
     session.gladiaClient.destroy();
 
     // 8. 세션 제거
-    activeSessions.delete(guild.id);
+    activeSessions.delete(session.voiceChannel.id);
 
     await interaction.editReply('✅ 회의 기록이 종료되었습니다. 아래 요약 노트를 확인하세요.');
 
@@ -211,7 +219,7 @@ async function stopMeeting(interaction) {
     try { session.voiceHandler?.destroy(); } catch {}
     try { session.gladiaClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
-    activeSessions.delete(guild.id);
+    activeSessions.delete(session.voiceChannel.id);
 
     await interaction.editReply(`❌ 종료 중 오류 발생: ${err.message}`);
   }
@@ -222,13 +230,28 @@ async function stopMeeting(interaction) {
  */
 async function checkStatus(interaction) {
   const guild = interaction.guild;
-  const session = activeSessions.get(guild.id);
+  const member = interaction.member;
+
+  // 유저가 접속한 음성 채널의 세션을 찾거나, 서버 내 세션 검색
+  const session = findSession(member, guild);
 
   if (!session) {
-    await interaction.reply({
-      content: '💤 현재 진행 중인 회의가 없습니다.',
-      flags: MessageFlags.Ephemeral,
-    });
+    // 서버 내 모든 활성 세션 목록 표시
+    const guildSessions = getGuildSessions(guild.id);
+    if (guildSessions.length > 0) {
+      const list = guildSessions
+        .map((s) => `• **${s.voiceChannel.name}** (${s.stats.durationFormatted}, 발언 ${s.stats.totalUtterances}건)`)
+        .join('\n');
+      await interaction.reply({
+        content: `📊 현재 서버에서 진행 중인 회의:\n${list}`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } else {
+      await interaction.reply({
+        content: '💤 현재 진행 중인 회의가 없습니다.',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
     return;
   }
 
@@ -247,6 +270,41 @@ async function checkStatus(interaction) {
     .setTimestamp();
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+/**
+ * 유저의 음성 채널 세션 찾기
+ * 1순위: 유저가 접속한 음성 채널의 세션
+ * 2순위: 서버에 세션이 1개뿐이면 그 세션
+ */
+function findSession(member, guild) {
+  // 유저가 음성 채널에 있으면 해당 채널 세션 반환
+  const voiceChannel = member.voice?.channel;
+  if (voiceChannel && activeSessions.has(voiceChannel.id)) {
+    return activeSessions.get(voiceChannel.id);
+  }
+
+  // 서버 내 활성 세션이 1개뿐이면 그 세션 반환
+  const guildSessions = getGuildSessions(guild.id);
+  if (guildSessions.length === 1) {
+    return guildSessions[0];
+  }
+
+  return null;
+}
+
+/**
+ * 서버(길드) 내 모든 활성 세션 조회
+ */
+function getGuildSessions(guildId) {
+  const sessions = [];
+  for (const [, session] of activeSessions) {
+    if (session.voiceChannel.guild.id === guildId) {
+      const stats = session.transcriptManager.getStats();
+      sessions.push({ ...session, stats });
+    }
+  }
+  return sessions;
 }
 
 // ── 이벤트 핸들러 ──

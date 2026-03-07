@@ -18,6 +18,11 @@ export class GladiaClient {
     this.isConnected = false;
     this.reconnectTimer = null;
     this.wsUrl = null;
+    this.keepAliveTimer = null;     // 무음 구간 WebSocket 유지용
+    this.lastAudioSent = 0;         // 마지막 오디오 전송 시각
+    this.destroyed = false;         // destroy 여부
+    this.reconnectAttempts = 0;     // 재연결 시도 횟수
+    this.maxReconnectAttempts = 5;  // 최대 재연결 시도
   }
 
   /**
@@ -68,6 +73,7 @@ export class GladiaClient {
     if (!this.wsUrl) {
       throw new Error('세션이 초기화되지 않았습니다. initSession()을 먼저 호출하세요.');
     }
+    if (this.destroyed) return;
 
     console.log('[Gladia] WebSocket 연결 중...');
     this.ws = new WebSocket(this.wsUrl);
@@ -75,6 +81,8 @@ export class GladiaClient {
     this.ws.on('open', () => {
       console.log('[Gladia] WebSocket 연결 완료');
       this.isConnected = true;
+      this.reconnectAttempts = 0;
+      this._startKeepAlive();
     });
 
     this.ws.on('message', (raw) => {
@@ -94,13 +102,46 @@ export class GladiaClient {
     this.ws.on('close', (code, reason) => {
       console.log(`[Gladia] WebSocket 종료 (code: ${code})`);
       this.isConnected = false;
+      this._stopKeepAlive();
+
+      if (this.destroyed) return;
 
       // 정상 종료 (1000) 가 아닌 경우 재연결 시도
-      if (code !== 1000 && this.wsUrl) {
-        console.log('[Gladia] 5초 후 재연결 시도...');
-        this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+      if (code !== 1000 && this.wsUrl && this.reconnectAttempts < this.maxReconnectAttempts) {
+        this.reconnectAttempts++;
+        const delay = Math.min(5000 * this.reconnectAttempts, 30000); // 점진적 대기 (5s, 10s, 15s, 20s, 25s)
+        console.log(`[Gladia] ${delay / 1000}초 후 재연결 시도 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+        this.reconnectTimer = setTimeout(() => this.connect(), delay);
+      } else if (code !== 1000) {
+        console.error(`[Gladia] 재연결 최대 횟수 초과 (code: ${code})`);
+        this.onError(new Error(`Gladia WebSocket 재연결 실패 (code: ${code})`));
       }
     });
+  }
+
+  /**
+   * 무음 구간에서 WebSocket 연결 유지용 keep-alive
+   * Gladia는 30초 무음시 연결을 끕으므로 (close code 4408)
+   * 20초마다 무음 패킷(silence) 전송
+   */
+  _startKeepAlive() {
+    this._stopKeepAlive();
+    // 16kHz, 16-bit, mono 기준 20ms 무음 = 640 bytes
+    const SILENCE_20MS = Buffer.alloc(640, 0);
+    this.keepAliveTimer = setInterval(() => {
+      if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      // 마지막 오디오 전송 후 20초 이상 경과한 경우만 무음 전송
+      if (Date.now() - this.lastAudioSent > 20000) {
+        this.ws.send(SILENCE_20MS);
+      }
+    }, 20000);
+  }
+
+  _stopKeepAlive() {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
   }
 
   /**
@@ -166,6 +207,7 @@ export class GladiaClient {
       return;
     }
     this.ws.send(audioBuffer);
+    this.lastAudioSent = Date.now();
   }
 
   /**
@@ -180,6 +222,7 @@ export class GladiaClient {
     }
 
     console.log('[Gladia] 녹음 중단 요청 전송...');
+    this._stopKeepAlive(); // stop_recording 후 무음 패킷 전송 중단
     this.ws.send(JSON.stringify({ type: 'stop_recording' }));
 
     return new Promise((resolve) => {
@@ -190,11 +233,8 @@ export class GladiaClient {
       };
 
       // 안전장치: WebSocket close 이벤트로도 resolve
-      const origClose = this.ws?.onclose;
       if (this.ws) {
-        const ws = this.ws;
-        const origListeners = ws.listeners('close');
-        ws.on('close', () => resolve(this.sessionId));
+        this.ws.on('close', () => resolve(this.sessionId));
       }
 
       // 타임아웃 안전장치 (60초)
@@ -224,6 +264,8 @@ export class GladiaClient {
    * 리소스 정리
    */
   destroy() {
+    this.destroyed = true;
+    this._stopKeepAlive();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

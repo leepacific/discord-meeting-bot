@@ -8,7 +8,7 @@
  *  /meeting-stop   : 전사 중단 + 요약 노트 생성
  *  /meeting-status : 현재 세션 상태 확인
  */
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } from 'discord.js';
 import config from './src/config.js';
 import { VoiceHandler } from './src/voiceHandler.js';
 import { GladiaClient } from './src/gladiaClient.js';
@@ -21,6 +21,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -38,7 +39,7 @@ async function startMeeting(interaction) {
   if (activeSessions.has(guild.id)) {
     await interaction.reply({
       content: '⚠️ 이미 회의 기록이 진행 중입니다. `/meeting-stop`으로 먼저 종료해주세요.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -48,7 +49,7 @@ async function startMeeting(interaction) {
   if (!voiceChannel) {
     await interaction.reply({
       content: '❌ 먼저 음성 채널에 접속해주세요.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -102,12 +103,12 @@ async function startMeeting(interaction) {
       },
     });
 
-    // Gladia 세션 시작
+    // 1. 음성 채널 먼저 접속 (실패 가능성이 가장 높음)
+    await voiceHandler.join(voiceChannel);
+
+    // 2. 음성 접속 성공 후 Gladia 세션 시작
     await gladiaClient.initSession();
     gladiaClient.connect();
-
-    // 음성 채널 접속
-    await voiceHandler.join(voiceChannel);
 
     // 세션 저장
     const session = {
@@ -138,13 +139,10 @@ async function startMeeting(interaction) {
 
   } catch (err) {
     console.error('[Main] 회의 시작 실패:', err);
-    // 실패 시 정리
-    const failedSession = activeSessions.get(guild.id);
-    if (failedSession) {
-      failedSession.voiceHandler?.destroy();
-      failedSession.gladiaClient?.destroy();
-      failedSession.transcriptManager?.destroy();
-    }
+    // 실패 시 모든 리소스 정리 (activeSessions에 저장 전이라도)
+    try { voiceHandler?.destroy(); } catch {}
+    try { gladiaClient?.destroy(); } catch {}
+    try { transcriptManager?.destroy(); } catch {}
     activeSessions.delete(guild.id);
     await interaction.editReply({
       content: `❌ 회의 시작 실패: ${err.message}`,
@@ -162,7 +160,7 @@ async function stopMeeting(interaction) {
   if (!session) {
     await interaction.reply({
       content: '⚠️ 현재 진행 중인 회의가 없습니다.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -228,7 +226,7 @@ async function checkStatus(interaction) {
   if (!session) {
     await interaction.reply({
       content: '💤 현재 진행 중인 회의가 없습니다.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -247,7 +245,7 @@ async function checkStatus(interaction) {
     )
     .setTimestamp();
 
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 // ── 이벤트 핸들러 ──
@@ -274,7 +272,7 @@ client.on('interactionCreate', async (interaction) => {
         await checkStatus(interaction);
         break;
       default:
-        await interaction.reply({ content: '알 수 없는 명령입니다.', ephemeral: true });
+        await interaction.reply({ content: '알 수 없는 명령입니다.', flags: MessageFlags.Ephemeral });
     }
   } catch (err) {
     console.error(`[Main] 커맨드 처리 오류 (${commandName}):`, err);
@@ -282,7 +280,7 @@ client.on('interactionCreate', async (interaction) => {
       ? interaction.editReply.bind(interaction)
       : interaction.reply.bind(interaction);
     try {
-      await reply({ content: `❌ 오류 발생: ${err.message}`, ephemeral: true });
+      await reply({ content: `❌ 오류 발생: ${err.message}`, flags: MessageFlags.Ephemeral });
     } catch {}
   }
 });

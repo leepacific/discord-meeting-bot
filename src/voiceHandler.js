@@ -46,11 +46,12 @@ export class VoiceHandler {
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
       selfDeaf: false,  // 봇이 오디오를 수신해야 하므로 deaf 해제
       selfMute: true,   // 봇은 말하지 않음
-      // DAVE E2EE 비활성화 - 오디오 수신(receive) 시 복호화 문제 회피
-      // @discordjs/voice 0.19.0 에서 DAVE 수신 측 버그로 인해 비활성화
-      daveEncryption: false,
-      // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비
-      decryptionFailureTolerance: 10,
+      // DAVE E2EE 활성화 (2026.03.02 이후 Discord 필수 요구사항)
+      // @snazzah/davey가 node_modules에 있으면 자동으로 DAVE 핸드셰이크 처리
+      daveEncryption: true,
+      // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비 (높게 설정)
+      decryptionFailureTolerance: 100,
+      debug: true,
     });
 
     // 연결 상태 변화 디버깅 로그
@@ -63,9 +64,14 @@ export class VoiceHandler {
       console.error('[Voice] 연결 오류:', err.message);
     });
 
-    // 연결 완료 대기 (30초 타임아웃 - DAVE 핸드셰이크 포함)
+    // 디버그 로그 수신
+    this.connection.on('debug', (msg) => {
+      console.log(`[Voice:debug] ${msg}`);
+    });
+
+    // 연결 완료 대기 (45초 타임아웃 - DAVE 핸드셰이크 포함)
     try {
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 45_000);
       console.log(`[Voice] 음성 채널 접속 완료: ${voiceChannel.name}`);
     } catch (err) {
       console.error(`[Voice] 연결 실패 상세:`, err);

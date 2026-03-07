@@ -109,11 +109,13 @@ async function startMeeting(interaction) {
       },
     });
 
-    // 1. 음성 채널 먼저 접속 (실패 가능성이 가장 높음)
-    await voiceHandler.join(voiceChannel);
+    // 1. 음성 채널 접속과 Gladia 세션 초기화를 병렬로 실행 (첨 전사 속도 향상)
+    const [, gladiaSession] = await Promise.all([
+      voiceHandler.join(voiceChannel),
+      gladiaClient.initSession(),
+    ]);
 
-    // 2. 음성 접속 성공 후 Gladia 세션 시작
-    await gladiaClient.initSession();
+    // 2. 양쪽 모두 성공하면 Gladia WebSocket 연결
     gladiaClient.connect();
 
     // 세션 저장

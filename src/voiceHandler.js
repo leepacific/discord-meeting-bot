@@ -65,11 +65,12 @@ export class VoiceHandler {
       console.error('[Voice] 연결 오류:', err.message);
     });
 
-    // 디버그 로그 (DAVE 핸드셰이크, 복호화 상태 확인용)
+    // 디버그 로그 (DAVE 핸드셰이크, 복호화 상태, WS 메시지 확인용)
     this.connection.on('debug', (msg) => {
-      // DAVE/복호화 관련 메시지만 필터링
-      if (msg.includes('decrypt') || msg.includes('DAVE') || msg.includes('dave') || msg.includes('packet')) {
-        console.log(`[Voice:debug] ${msg}`);
+      // WS 수신 메시지, DAVE, 복호화, speaking, state 관련 모두 로깅
+      if (msg.includes('<<') || msg.includes('DAVE') || msg.includes('decrypt') || 
+          msg.includes('speaking') || msg.includes('state change')) {
+        console.log(`[Voice:debug] ${msg.substring(0, 500)}`);
       }
     });
 

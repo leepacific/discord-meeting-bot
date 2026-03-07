@@ -100,6 +100,14 @@ export class VoiceHandler {
       }
     });
 
+    // SSRC 맵 변경 모니터링 (화자 정보 수신 확인)
+    this.connection.receiver.ssrcMap.on('update', (data) => {
+      console.log(`[Voice] SSRC 맵 업데이트:`, JSON.stringify(data));
+    });
+
+    // UDP 패킷 수신 여부 확인용 - networking 상태에서 직접 UDP 소켓 감시
+    this._monitorUdpPackets();
+
     // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
     this.connection.receiver.speaking.on('start', (userId) => {
       if (!this.activeStreams.has(userId) && !this.destroyed) {
@@ -108,10 +116,59 @@ export class VoiceHandler {
       }
     });
 
+    this.connection.receiver.speaking.on('end', (userId) => {
+      console.log(`[Voice] 유저 스피킹 종료: ${userId}`);
+    });
+
     // 주기적으로 오디오 믹싱 및 전송
     this._startMixing();
 
     return this.connection;
+  }
+
+  /**
+   * UDP 패킷 수신 모니터링 (디버깅용)
+   */
+  _monitorUdpPackets() {
+    let udpCount = 0;
+    let lastLog = Date.now();
+    let monitorAttached = false;
+
+    const tryAttach = () => {
+      if (monitorAttached || this.destroyed || !this.connection) return;
+
+      const state = this.connection.state;
+      if (state.status === 'ready' && state.networking) {
+        const netState = state.networking.state;
+        // networking state code 4 = Ready
+        if (netState.code >= 2 && netState.udp) {
+          try {
+            // UDP socket의 내부 socket에 접근
+            const udpSocket = netState.udp;
+            if (udpSocket && udpSocket.socket) {
+              udpSocket.socket.on('message', () => {
+                udpCount++;
+                const now = Date.now();
+                if (now - lastLog > 5000) {
+                  console.log(`[Voice] UDP raw 패킷: ${udpCount}개 (최근 5초), SSRC맵 크기: ${this.connection?.receiver?.ssrcMap?.map?.size ?? '?'}`);
+                  udpCount = 0;
+                  lastLog = now;
+                }
+              });
+              monitorAttached = true;
+              console.log('[Voice] UDP 소켓 모니터링 시작');
+            }
+          } catch (e) {
+            console.log('[Voice] UDP 소켓 모니터링 실패:', e.message);
+          }
+        }
+      }
+    };
+
+    // 연결 상태 변경 시 시도
+    this.connection.on('stateChange', () => tryAttach());
+    // 즉시 시도
+    tryAttach();
   }
 
   /**

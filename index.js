@@ -14,6 +14,8 @@ import config from './src/config.js';
 import { VoiceHandler } from './src/voiceHandler.js';
 import { GladiaClient } from './src/gladiaClient.js';
 import { TranscriptManager } from './src/transcriptManager.js';
+import { ChatCollector } from './src/chatCollector.js';
+import { LlmSummarizer } from './src/llmSummarizer.js';
 import { SummaryGenerator } from './src/summaryGenerator.js';
 
 // ── Discord 클라이언트 초기화 ──
@@ -23,6 +25,7 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,  // 채팅 내용 수집용
   ],
 });
 
@@ -64,24 +67,23 @@ async function startMeeting(interaction) {
   let voiceHandler = null;
   let gladiaClient = null;
   let transcriptManager = null;
+  let chatCollector = null;
 
   try {
     // 전사 매니저 초기화
     transcriptManager = new TranscriptManager();
     transcriptManager.start(interaction.channel);
 
-    // Gladia 요약 결과를 저장할 변수
-    let gladiaSummary = null;
+    // 채팅 수집기 초기화
+    chatCollector = new ChatCollector(client);
+    chatCollector.start(interaction.channel);
 
-    // Gladia 클라이언트 초기화
+    // Gladia 클라이언트 초기화 (요약은 LLM으로 대체, 전사만 사용)
     gladiaClient = new GladiaClient({
       onTranscript: (data) => {
         transcriptManager.addTranscript(data);
       },
-      onSummary: (summary) => {
-        console.log('[Main] 요약 결과 수신');
-        gladiaSummary = summary;
-      },
+      onSummary: () => {},  // LLM 요약으로 대체, 미사용
       onError: (err) => {
         console.error('[Main] Gladia 오류:', err.message);
       },
@@ -151,11 +153,11 @@ async function startMeeting(interaction) {
       voiceHandler,
       gladiaClient,
       transcriptManager,
+      chatCollector,
       voiceChannel,
       textChannel: interaction.channel,
       startedBy: member.user.tag,
       startedAt: new Date(),
-      getSummary: () => gladiaSummary,
     };
     activeSessions.set(voiceChannel.id, session);
 
@@ -179,6 +181,7 @@ async function startMeeting(interaction) {
     try { voiceHandler?.destroy(); } catch {}
     try { gladiaClient?.destroy(); } catch {}
     try { transcriptManager?.destroy(); } catch {}
+    try { chatCollector?.destroy(); } catch {}
     activeSessions.delete(voiceChannel.id);
     await interaction.editReply({
       content: `❌ 회의 시작 실패: ${err.message}`,
@@ -203,6 +206,9 @@ function handleForceDisconnect(channelId) {
 
   // 전사 매니저 정리 (남은 버퍼 전송)
   try { session.transcriptManager?.destroy(); } catch {}
+
+  // 채팅 수집기 정리
+  try { session.chatCollector?.destroy(); } catch {}
 
   // 세션 제거
   activeSessions.delete(channelId);
@@ -250,6 +256,7 @@ async function stopMeeting(interaction) {
     try { session.voiceHandler?.destroy(); } catch {}
     try { session.gladiaClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
+    try { session.chatCollector?.destroy(); } catch {}
     activeSessions.delete(session.voiceChannel.id);
 
     await interaction.editReply(`❌ 종료 중 오류 발생: ${err.message}`);
@@ -263,64 +270,49 @@ async function performStopMeeting(session) {
   // 0. 먼저 세션을 맵에서 제거하여 중복 종료 및 voiceStateUpdate 간섭 방지
   activeSessions.delete(session.voiceChannel.id);
 
-  // 1. 먼저 Gladia에 stop_recording 전송 (후처리 트리거)
-  const stopResult = await session.gladiaClient.stopRecording();
+  // 1. Gladia에 stop_recording 전송
+  await session.gladiaClient.stopRecording();
 
   // 2. 음성 스트림 중단
   session.voiceHandler.destroy();
 
-  // 3. WebSocket으로 요약이 수신되지 않았으면 REST API로 폴백 조회
-  let summary = session.getSummary();
-
-  if (!summary && stopResult && !stopResult.summaryReceived) {
-    console.log('[Main] WebSocket으로 요약 미수신, REST API 폴백 시도...');
-
-    // Gladia 후처리 완료까지 폴링 (최대 3회, 5초 간격)
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      console.log(`[Main] REST API 요약 조회 시도 ${attempt}/3...`);
-
-      try {
-        const results = await session.gladiaClient.getSessionResults();
-
-        // REST API 응답 구조: result.summarization (post_processing 아님)
-        const summaryData = results?.result?.summarization;
-        if (summaryData && summaryData.success && !summaryData.is_empty) {
-          summary = summaryData;
-          console.log('[Main] REST API로 요약 획득 성공');
-          break;
-        } else if (results?.status === 'done' && !summaryData) {
-          // 세션 완료되었으나 요약이 null/undefined → 전사된 내용이 없어 요약 생성 불가
-          console.log('[Main] 전사 내용 없음, 요약 생성 불가 (REST 폴백 중단)');
-          break;
-        } else {
-          console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt}), status: ${results?.status}, summarization: ${JSON.stringify(summaryData?.success ?? null)}`);
-        }
-      } catch (err) {
-        console.error(`[Main] REST API 요약 조회 실패 (attempt ${attempt}):`, err.message);
-      }
-    }
-  }
-
-  // 4. 통계 및 전사록 수집 (destroy 전에)
+  // 3. 통계 및 전사록 수집 (destroy 전에)
   const stats = session.transcriptManager.getStats();
   const fullTranscript = session.transcriptManager.getFullTranscript();
 
-  // 5. 전사 매니저 정리 (남은 버퍼 전송)
-  session.transcriptManager.destroy();
+  // 4. 채팅 내용 수집
+  const chatTranscript = session.chatCollector.getChatTranscript();
+  stats.chatMessageCount = session.chatCollector.messageCount;
 
-  // 6. 요약 전송
+  // 5. 전사 매니저 및 채팅 수집기 정리
+  session.transcriptManager.destroy();
+  session.chatCollector.destroy();
+
+  // 6. LLM 통합 요약 생성 (음성 전사 + 채팅)
+  let summary = null;
+  try {
+    summary = await LlmSummarizer.summarize({
+      voiceTranscript: fullTranscript,
+      chatTranscript,
+      stats,
+    });
+  } catch (err) {
+    console.error('[Main] LLM 요약 생성 실패:', err.message);
+  }
+
+  // 7. 요약 전송
   await SummaryGenerator.send({
     summary,
     stats,
     fullTranscript,
+    chatTranscript,
     textChannel: session.textChannel,
   });
 
-  // 7. Gladia 정리
+  // 8. Gladia 정리
   session.gladiaClient.destroy();
 
-  // 8. 세션 제거 (이미 0단계에서 제거됨, 안전을 위한 중복 호출)
+  // 9. 세션 제거 (이미 0단계에서 제거됨, 안전을 위한 중복 호출)
   activeSessions.delete(session.voiceChannel.id);
 }
 
@@ -432,6 +424,7 @@ function setAutoStopTimer(channelId) {
       try { session.voiceHandler?.destroy(); } catch {}
       try { session.gladiaClient?.destroy(); } catch {}
       try { session.transcriptManager?.destroy(); } catch {}
+      try { session.chatCollector?.destroy(); } catch {}
       activeSessions.delete(channelId);
     }
   }, AUTO_STOP_DELAY_MS);
@@ -536,6 +529,7 @@ process.on('SIGINT', () => {
     try { session.voiceHandler?.destroy(); } catch {}
     try { session.gladiaClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
+    try { session.chatCollector?.destroy(); } catch {}
   }
   activeSessions.clear();
   client.destroy();
@@ -549,6 +543,7 @@ process.on('SIGTERM', () => {
     try { session.voiceHandler?.destroy(); } catch {}
     try { session.gladiaClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
+    try { session.chatCollector?.destroy(); } catch {}
   }
   activeSessions.clear();
   client.destroy();

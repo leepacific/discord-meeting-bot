@@ -9,6 +9,10 @@ const config = {
   gladiaApiKey: process.env.GLADIA_API_KEY,
   gladiaApiUrl: 'https://api.gladia.io/v2/live',
 
+  // OpenRouter (LLM 요약)
+  openrouterApiKey: process.env.OPENROUTER_API_KEY,
+  openrouterModel: process.env.OPENROUTER_MODEL || 'anthropic/claude-opus-4.6',
+
   // Audio settings
   audio: {
     sampleRate: 16000,
@@ -30,8 +34,7 @@ const config = {
       sentiment_analysis: false,
     },
     postProcessing: {
-      summarization: true,
-      summarization_config: { type: 'general' },
+      summarization: false,  // LLM 요약으로 대체 (Gladia 요약 비활성화)
       chapterization: false,
     },
     messagesConfig: {
@@ -49,7 +52,7 @@ const config = {
 };
 
 // 필수 환경변수 검증
-const required = ['discordToken', 'discordClientId', 'gladiaApiKey'];
+const required = ['discordToken', 'discordClientId', 'gladiaApiKey', 'openrouterApiKey'];
 for (const key of required) {
   if (!config[key]) {
     console.error(`❌ 환경변수 누락: ${key}`);

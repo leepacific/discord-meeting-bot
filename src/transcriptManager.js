@@ -57,8 +57,8 @@ export class TranscriptManager {
 
     this.entries.push(entry);
 
-    // 메시지 버퍼에 추가 (배치 전송)
-    this.messageBuffer.push(`**${speakerName}** \`${timestamp}\`\n${text.trim()}`);
+    // 실시간 채팅 출력은 비활성화 (요약 + 회의록 파일에만 포함)
+    // this.messageBuffer.push(`**${speakerName}** \`${timestamp}\`\n${text.trim()}`);
 
     console.log(`[Transcript] [${timestamp}] ${speakerName}: ${text.trim()}`);
   }

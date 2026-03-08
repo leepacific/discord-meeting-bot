@@ -291,7 +291,7 @@ export class ElevenLabsClient {
       return Promise.resolve({ sessionId: this.sessionId });
     }
 
-    console.log('[ElevenLabs] 녹음 중단 (WebSocket 종료)...');
+    console.log('[ElevenLabs] 녹음 중단: 마지막 세그먼트 커밋 후 종료...');
 
     return new Promise((resolve) => {
       let resolved = false;
@@ -309,10 +309,24 @@ export class ElevenLabsClient {
         });
       }
 
-      // 정상 종료 요청
+      // 종료 전 마지막 세그먼트 수동 커밋 (flush)
       try {
-        this.ws.close(1000);
-      } catch {}
+        this.ws.send(JSON.stringify({
+          message_type: 'input_audio_chunk',
+          audio_base_64: Buffer.alloc(640, 0).toString('base64'),
+          commit: true,
+        }));
+        console.log('[ElevenLabs] 마지막 커밋 전송 완료');
+      } catch (err) {
+        console.warn('[ElevenLabs] 커밋 전송 실패:', err.message);
+      }
+
+      // 커밋 응답 대기 후 종료 (2초 대기)
+      setTimeout(() => {
+        try {
+          this.ws.close(1000);
+        } catch {}
+      }, 2000);
 
       // 타임아웃 안전장치 (10초)
       setTimeout(() => {

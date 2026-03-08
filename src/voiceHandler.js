@@ -116,6 +116,9 @@ export class VoiceHandler {
     // UDP 패킷 수신 모니터링 (기능 유지에 필요, 로그 주기만 60초로)
     this._monitorUdpPackets();
 
+    // 채널에 이미 있는 유저들을 미리 구독 (DAVE 키 교환 선행 완료 유도)
+    this._preSubscribeExistingUsers(voiceChannel);
+
     // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
     this.connection.receiver.speaking.on('start', (userId) => {
       if (!this.activeStreams.has(userId) && !this.destroyed) {
@@ -130,6 +133,28 @@ export class VoiceHandler {
     this._startInactivityCleanup();
 
     return this.connection;
+  }
+
+  /**
+   * 채널에 이미 존재하는 유저들을 미리 구독
+   * DAVE 키 교환이 speaking 이벤트 전에 완료되도록 유도하여
+   * 첫 발언 유실을 최소화
+   */
+  _preSubscribeExistingUsers(voiceChannel) {
+    try {
+      const members = voiceChannel.members;
+      if (!members) return;
+
+      for (const [userId, member] of members) {
+        if (member.user.bot) continue; // 봇 제외
+        if (this.activeStreams.has(userId)) continue; // 이미 구독 중
+
+        console.log(`[Voice] 기존 유저 선행 구독: ${member.displayName} (${userId})`);
+        this._subscribeUser(userId);
+      }
+    } catch (err) {
+      console.log('[Voice] 선행 구독 실패 (무시):', err.message);
+    }
   }
 
   /**

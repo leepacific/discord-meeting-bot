@@ -34,6 +34,14 @@ export class ElevenLabsClient {
     this.maxReconnectAttempts = 5;
     this.keepAliveTimer = null;
     this.lastAudioSent = 0;
+
+    // 재연결 시 컨텍스트 유지용 (previous_text)
+    this.lastCommittedText = '';
+    this.needsPreviousText = false;  // 재연결 후 첫 오디오에 previous_text 전송 플래그
+
+    // 연결 끊김 감지용 (연속 send 실패 카운터)
+    this.consecutiveSendFailures = 0;
+    this.maxConsecutiveSendFailures = 50;  // 50회 연속 실패 시 재연결
   }
 
   /**
@@ -53,6 +61,14 @@ export class ElevenLabsClient {
       vad_silence_threshold_secs: String(config.elevenlabs.vadSilenceThresholdSecs),
       vad_threshold: String(config.elevenlabs.vadThreshold),
     });
+
+    // VAD 안정화 파라미터 (잡음/짧은 소리 오인식 방지)
+    if (config.elevenlabs.minSpeechDurationMs) {
+      params.set('min_speech_duration_ms', String(config.elevenlabs.minSpeechDurationMs));
+    }
+    if (config.elevenlabs.minSilenceDurationMs) {
+      params.set('min_silence_duration_ms', String(config.elevenlabs.minSilenceDurationMs));
+    }
 
     // 한국어 고정 설정이 있으면 추가
     if (config.elevenlabs.languageCode) {
@@ -138,6 +154,13 @@ export class ElevenLabsClient {
         this.ws = null;
       }
       this.isConnected = false;
+      this.consecutiveSendFailures = 0;
+
+      // 재연결 시 첫 오디오 청크에 previous_text 전송 플래그 설정
+      if (this.lastCommittedText) {
+        this.needsPreviousText = true;
+        console.log(`[ElevenLabs:${this.label}] 재연결 시 previous_text 전송 예정: "${this.lastCommittedText}"`);
+      }
 
       console.log(`[ElevenLabs:${this.label}] 재연결 시도...`);
       await this.initSession();
@@ -205,6 +228,9 @@ export class ElevenLabsClient {
         const text = message.text;
         if (!text || text.trim().length === 0) break;
 
+        // 재연결 시 previous_text로 사용하기 위해 마지막 커밋 텍스트 저장 (최대 50자)
+        this.lastCommittedText = text.trim().slice(-50);
+
         // 회의 시작 시점 기준 경과 시간(초)
         const elapsedSec = (Date.now() - this.meetingStartTime) / 1000;
 
@@ -224,6 +250,9 @@ export class ElevenLabsClient {
         // 타임스탬프 포함 전사 (include_timestamps=true 시)
         const text = message.text;
         if (!text || text.trim().length === 0) break;
+
+        // 재연결 시 previous_text로 사용하기 위해 마지막 커밋 텍스트 저장
+        this.lastCommittedText = text.trim().slice(-50);
 
         const elapsedSec2 = (Date.now() - this.meetingStartTime) / 1000;
 
@@ -283,10 +312,17 @@ export class ElevenLabsClient {
    */
   sendAudio(audioBuffer) {
     if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // 연결이 끊긴 상태에서 연속 실패 감지 → 명시적 재연결
+      this.consecutiveSendFailures++;
+      if (this.consecutiveSendFailures === this.maxConsecutiveSendFailures) {
+        console.warn(`[ElevenLabs:${this.label}] 연속 ${this.consecutiveSendFailures}회 send 실패, 재연결 시도...`);
+        this._reconnect();
+      }
       return;
     }
+    this.consecutiveSendFailures = 0;
 
-    // 오디오 전송 통계 (처음 10회만 로그)
+    // 오디오 전송 통계 (처음 5회 + 주기적 로그)
     if (!this._sendCount) this._sendCount = 0;
     this._sendCount++;
     if (this._sendCount <= 5 || this._sendCount % 200 === 0) {
@@ -295,11 +331,20 @@ export class ElevenLabsClient {
 
     // ElevenLabs는 JSON 메시지로 base64 인코딩된 오디오를 전송
     // sample_rate를 명시적으로 포함 (공식 SDK 및 문서 권장사항)
-    this.ws.send(JSON.stringify({
+    const message = {
       message_type: 'input_audio_chunk',
       audio_base_64: audioBuffer.toString('base64'),
       sample_rate: 16000,
-    }));
+    };
+
+    // 재연결 후 첫 오디오 청크에 previous_text 전송 (컨텍스트 연속성 유지)
+    if (this.needsPreviousText && this.lastCommittedText) {
+      message.previous_text = this.lastCommittedText;
+      this.needsPreviousText = false;
+      console.log(`[ElevenLabs:${this.label}] previous_text 전송: "${this.lastCommittedText}"`);
+    }
+
+    this.ws.send(JSON.stringify(message));
     this.lastAudioSent = Date.now();
   }
 

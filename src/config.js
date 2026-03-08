@@ -26,8 +26,10 @@ const config = {
     modelId: 'scribe_v2_realtime',
     languageCode: 'ko',           // 한국어 고정 (자동 감지 원하면 제거)
     commitStrategy: 'vad',         // 자동 음성 구간 감지
-    vadSilenceThresholdSecs: 1.0,  // 1초 무음 시 커밋
+    vadSilenceThresholdSecs: 1.5,  // 1.5초 무음 시 커밋 (기본값, 1.0은 너무 짧아 commit_throttled 위험)
     vadThreshold: 0.4,             // VAD 감도
+    minSpeechDurationMs: 150,      // 최소 발화 길이 (잡음 오인식 방지, 기본 100)
+    minSilenceDurationMs: 200,     // 최소 무음 길이 (문장 중간 끊김 방지, 기본 100)
   },
 };
 

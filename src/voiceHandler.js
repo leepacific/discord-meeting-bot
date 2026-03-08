@@ -64,7 +64,8 @@ export class VoiceHandler {
       // DAVE E2EE 활성화 (@snazzah/davey가 자동으로 핸드셰이크 처리)
       daveEncryption: true,
       // 복호화 실패 허용 횟수 - DAVE 키 전환(rotation) 중 일시적 실패 대비
-      decryptionFailureTolerance: 500,
+      // 기본값 24는 너무 낮아 잘 끊김, 500은 불필요하게 높음 → 200으로 적정
+      decryptionFailureTolerance: 200,
       // debug 플래그 유지 (오디오 수신 안정성에 필요)
       debug: true,
     });
@@ -74,7 +75,7 @@ export class VoiceHandler {
     this.connection.on('debug', (msg) => {
       if (msg.includes('Failed to decrypt')) {
         consecutiveDecryptFails++;
-        if (consecutiveDecryptFails === 10 || consecutiveDecryptFails % 50 === 0) {
+        if (consecutiveDecryptFails === 5 || consecutiveDecryptFails % 50 === 0) {
           console.warn(`[Voice:DAVE] 복호화 실패 ${consecutiveDecryptFails}회 연속`);
         }
       } else {
@@ -187,7 +188,16 @@ export class VoiceHandler {
    * 0.25초마다 무음 Opus 프레임을 생성하는 스트림을 재생
    */
   _startSilencePlayer() {
-    if (!this.connection) return;
+    if (!this.connection || this.destroyed) return;
+
+    // 기존 플레이어 정리 (재시작 시 이벤트 리스너 중복 방지)
+    if (this.silencePlayer) {
+      try {
+        this.silencePlayer.removeAllListeners();
+        this.silencePlayer.stop(true);
+      } catch {}
+      this.silencePlayer = null;
+    }
 
     try {
       this.silencePlayer = createAudioPlayer();
@@ -212,9 +222,28 @@ export class VoiceHandler {
       this.silencePlayer.play(resource);
       this.connection.subscribe(this.silencePlayer);
 
+      // 에러/중단 시 자동 재시작 (무음 플레이어가 멈추면 오디오 수신이 중단됨)
+      this.silencePlayer.on('error', (err) => {
+        console.warn('[Voice] 무음 플레이어 에러, 재시작:', err.message);
+        if (!this.destroyed) {
+          setTimeout(() => this._startSilencePlayer(), 1000);
+        }
+      });
+
+      this.silencePlayer.on(AudioPlayerStatus.Idle, () => {
+        // 예기치 않게 재생이 멈춘 경우 재시작
+        if (!this.destroyed) {
+          console.log('[Voice] 무음 플레이어 idle, 재시작...');
+          setTimeout(() => this._startSilencePlayer(), 500);
+        }
+      });
+
       console.log('[Voice] 무음 재생 시작 (오디오 수신 활성화)');
     } catch (err) {
-      console.warn('[Voice] 무음 재생 실패 (무시):', err.message);
+      console.warn('[Voice] 무음 재생 실패, 2초 후 재시도:', err.message);
+      if (!this.destroyed) {
+        setTimeout(() => this._startSilencePlayer(), 2000);
+      }
     }
   }
 
@@ -286,7 +315,7 @@ export class VoiceHandler {
     const opusStream = this.connection.receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterInactivity,
-        duration: 1000,
+        duration: 2000, // 2초 무음 후 스트림 종료 (1초는 문장 중간 끊김 위험)
       },
     });
 
@@ -464,8 +493,9 @@ export class VoiceHandler {
     this._cleanupTimers();
     this._cleanupAllStreams();
 
-    // 무음 재생기 정리
+    // 무음 재생기 정리 (리스너 먼저 제거하여 Idle 핸들러 재시작 방지)
     if (this.silencePlayer) {
+      try { this.silencePlayer.removeAllListeners(); } catch {}
       try { this.silencePlayer.stop(true); } catch {}
       this.silencePlayer = null;
     }

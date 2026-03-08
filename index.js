@@ -547,16 +547,33 @@ process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
 });
 
-function gracefulShutdown(signal) {
+async function gracefulShutdown(signal) {
   console.log(`${signal} 수신, 정리 중...`);
   for (const [channelId, session] of activeSessions) {
     clearAutoStopTimer(channelId);
-    try { session.voiceHandler?.destroy(); } catch {}
+
+    // STT 녹음 중단 (마지막 전사 결과 flush, 최대 5초 대기)
     if (session.sttClients) {
+      const stopPromises = [];
+      for (const [, userStt] of session.sttClients) {
+        stopPromises.push(
+          userStt.stopRecording()
+            .catch((err) => console.error('[Shutdown] STT stop 오류:', err.message))
+        );
+      }
+      try {
+        await Promise.race([
+          Promise.all(stopPromises),
+          new Promise((resolve) => setTimeout(resolve, 5000)), // 5초 타임아웃
+        ]);
+      } catch {}
+      // destroy는 stopRecording 후 호출
       for (const [, userStt] of session.sttClients) {
         try { userStt.destroy(); } catch {}
       }
     }
+
+    try { session.voiceHandler?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
   }

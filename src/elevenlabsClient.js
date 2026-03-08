@@ -18,11 +18,13 @@ export class ElevenLabsClient {
    * @param {Function} opts.onSessionEnd - 세션 종료 콜백
    * @param {string}   [opts.label] - 로그 식별자 (예: 유저 이름)
    */
-  constructor({ onTranscript, onError, onSessionEnd, label }) {
+  constructor({ onTranscript, onError, onSessionEnd, label, meetingStartTime }) {
     this.onTranscript = onTranscript || (() => {});
     this.onError = onError || (() => {});
     this.onSessionEnd = onSessionEnd || (() => {});
     this.label = label || 'default';
+    // 회의 시작 시점 (모든 유저가 동일한 기준점 사용)
+    this.meetingStartTime = meetingStartTime || Date.now();
     this.ws = null;
     this.sessionId = null;
     this.isConnected = false;
@@ -203,13 +205,16 @@ export class ElevenLabsClient {
         const text = message.text;
         if (!text || text.trim().length === 0) break;
 
+        // 회의 시작 시점 기준 경과 시간(초)
+        const elapsedSec = (Date.now() - this.meetingStartTime) / 1000;
+
         this.onTranscript({
           text: text.trim(),
           channel: 0,        // ElevenLabs는 단일 채널
           speaker: null,     // 화자 구분은 voiceHandler의 SSRC 매핑으로 처리
           language: config.elevenlabs.languageCode || null,
-          start: null,
-          end: null,
+          start: elapsedSec,
+          end: elapsedSec,
           id: `el-${Date.now()}`,
         });
         break;
@@ -220,13 +225,15 @@ export class ElevenLabsClient {
         const text = message.text;
         if (!text || text.trim().length === 0) break;
 
+        const elapsedSec2 = (Date.now() - this.meetingStartTime) / 1000;
+
         this.onTranscript({
           text: text.trim(),
           channel: 0,
           speaker: null,
           language: message.language_code || config.elevenlabs.languageCode || null,
-          start: null,
-          end: null,
+          start: elapsedSec2,
+          end: elapsedSec2,
           id: `el-${Date.now()}`,
         });
         break;

@@ -69,6 +69,9 @@ async function startMeeting(interaction) {
   let transcriptManager = null;
   let chatCollector = null;
 
+  // 회의 시작 시점 (모든 STT 세션의 타임스탬프 기준점, 클로저로 참조)
+  const meetingStartMs = Date.now();
+
   try {
     // 전사 매니저 초기화
     transcriptManager = new TranscriptManager();
@@ -98,6 +101,7 @@ async function startMeeting(interaction) {
           if (!sttClients.has(userId)) {
             const userStt = new ElevenLabsClient({
               label: displayName,
+              meetingStartTime: meetingStartMs,
               onTranscript: (data) => {
                 // 해당 유저의 채널 번호로 화자 구분
                 transcriptManager.addTranscript({ ...data, channel });
@@ -151,7 +155,8 @@ async function startMeeting(interaction) {
       voiceChannel,
       textChannel: interaction.channel,
       startedBy: member.user.tag,
-      startedAt: new Date(),
+      startedAt: new Date(meetingStartMs),
+      meetingStartMs,
     };
     activeSessions.set(voiceChannel.id, session);
 

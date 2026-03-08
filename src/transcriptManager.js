@@ -115,7 +115,9 @@ export class TranscriptManager {
    * 전체 전사 텍스트 반환 (요약용)
    */
   getFullTranscript() {
-    return this.entries
+    // start(경과 시간) 기준으로 시간순 정렬 후 반환
+    const sorted = [...this.entries].sort((a, b) => (a.start || 0) - (b.start || 0));
+    return sorted
       .map((e) => `[${e.timestamp}] ${e.speaker}: ${e.text}`)
       .join('\n');
   }

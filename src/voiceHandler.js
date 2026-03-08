@@ -10,8 +10,8 @@ import prism from 'prism-media';
  * 디스코드 음성 채널 핸들러
  * - 음성 채널 접속/퇴장
  * - 유저별 오디오 스트림 수신 (Opus → PCM 변환)
- * - 모노 믹스다운 후 Gladia 로 단일 채널 전송
- *   (Gladia 내장 diarization 이 화자 구분 담당)
+ * - 모노 믹스다운 후 STT 엔진으로 단일 채널 전송
+ *   (SSRC 기반 화자 구분 담당)
  *
  * NOTE: Discord DAVE (E2EE) 프로토콜 지원 (2026.03.02 이후 필수)
  *       @snazzah/davey 패키지가 node_modules에 있으면 자동으로 DAVE 활성화됨

@@ -1,7 +1,7 @@
 /**
  * Discord 라이브 회의 노트 테이킹 봇
  * ─────────────────────────────────────
- * Gladia 실시간 STT API를 활용한 디스코드 회의 자동 기록 봇
+ * ElevenLabs Scribe v2 Realtime STT 를 활용한 디스코드 회의 자동 기록 봇
  *
  * 커맨드:
  *  /meeting-start  : 음성 채널 접속 + 실시간 전사 시작
@@ -12,7 +12,7 @@ import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags, Events } from 'd
 import { generateDependencyReport } from '@discordjs/voice';
 import config from './src/config.js';
 import { VoiceHandler } from './src/voiceHandler.js';
-import { GladiaClient } from './src/gladiaClient.js';
+import { ElevenLabsClient } from './src/elevenlabsClient.js';
 import { TranscriptManager } from './src/transcriptManager.js';
 import { ChatCollector } from './src/chatCollector.js';
 import { LlmSummarizer } from './src/llmSummarizer.js';
@@ -65,7 +65,7 @@ async function startMeeting(interaction) {
 
   // try 블록 밖에 선언하여 catch에서도 접근 가능하도록 함
   let voiceHandler = null;
-  let gladiaClient = null;
+  let sttClient = null;
   let transcriptManager = null;
   let chatCollector = null;
 
@@ -78,24 +78,23 @@ async function startMeeting(interaction) {
     chatCollector = new ChatCollector(client);
     chatCollector.start(interaction.channel);
 
-    // Gladia 클라이언트 초기화 (요약은 LLM으로 대체, 전사만 사용)
-    gladiaClient = new GladiaClient({
+    // ElevenLabs STT 클라이언트 초기화
+    sttClient = new ElevenLabsClient({
       onTranscript: (data) => {
         transcriptManager.addTranscript(data);
       },
-      onSummary: () => {},  // LLM 요약으로 대체, 미사용
       onError: (err) => {
-        console.error('[Main] Gladia 오류:', err.message);
+        console.error('[Main] STT 오류:', err.message);
       },
       onSessionEnd: (sessionId) => {
-        console.log(`[Main] Gladia 세션 종료: ${sessionId}`);
+        console.log(`[Main] STT 세션 종료: ${sessionId}`);
       },
     });
 
     // Voice 핸들러 초기화
     voiceHandler = new VoiceHandler({
       onAudioData: (audioBuffer) => {
-        gladiaClient.sendAudio(audioBuffer);
+        sttClient.sendAudio(audioBuffer);
       },
       onUserJoin: async (userId, channel) => {
         try {
@@ -118,15 +117,15 @@ async function startMeeting(interaction) {
       },
     });
 
-    // 1. 음성 채널 접속과 Gladia 세션 초기화를 병렬로 실행 (첨 전사 속도 향상)
+    // 1. 음성 채널 접속과 STT 세션 초기화를 병렬로 실행
     //    한쪽이 실패해도 양쪽 모두 정리되도록 처리
     let voiceJoined = false;
-    let gladiaInited = false;
+    let sttInited = false;
 
     try {
       const results = await Promise.allSettled([
         voiceHandler.join(voiceChannel),
-        gladiaClient.initSession(),
+        sttClient.initSession(),
       ]);
 
       if (results[0].status === 'rejected') {
@@ -135,23 +134,23 @@ async function startMeeting(interaction) {
       voiceJoined = true;
 
       if (results[1].status === 'rejected') {
-        throw new Error(`Gladia 세션 초기화 실패: ${results[1].reason?.message || results[1].reason}`);
+        throw new Error(`STT 세션 초기화 실패: ${results[1].reason?.message || results[1].reason}`);
       }
-      gladiaInited = true;
+      sttInited = true;
     } catch (initErr) {
       // 한쪽만 성공한 경우 성공한 쪽 정리
       if (voiceJoined) try { voiceHandler.destroy(); } catch {}
-      if (gladiaInited) try { gladiaClient.destroy(); } catch {}
+      if (sttInited) try { sttClient.destroy(); } catch {}
       throw initErr;
     }
 
-    // 2. 양쪽 모두 성공하면 Gladia WebSocket 연결
-    gladiaClient.connect();
+    // 2. 양쪽 모두 성공하면 STT WebSocket 연결
+    sttClient.connect();
 
     // 세션 저장
     const session = {
       voiceHandler,
-      gladiaClient,
+      sttClient,
       transcriptManager,
       chatCollector,
       voiceChannel,
@@ -179,7 +178,7 @@ async function startMeeting(interaction) {
     console.error('[Main] 회의 시작 실패:', err);
     // 실패 시 모든 리소스 정리
     try { voiceHandler?.destroy(); } catch {}
-    try { gladiaClient?.destroy(); } catch {}
+    try { sttClient?.destroy(); } catch {}
     try { transcriptManager?.destroy(); } catch {}
     try { chatCollector?.destroy(); } catch {}
     activeSessions.delete(voiceChannel.id);
@@ -201,8 +200,8 @@ function handleForceDisconnect(channelId) {
   // 자동 종료 타이머가 있으면 제거
   clearAutoStopTimer(channelId);
 
-  // Gladia 정리
-  try { session.gladiaClient?.destroy(); } catch {}
+  // STT 정리
+  try { session.sttClient?.destroy(); } catch {}
 
   // 전사 매니저 정리 (남은 버퍼 전송)
   try { session.transcriptManager?.destroy(); } catch {}
@@ -254,7 +253,7 @@ async function stopMeeting(interaction) {
     console.error('[Main] 회의 종료 실패:', err);
     // 강제 정리
     try { session.voiceHandler?.destroy(); } catch {}
-    try { session.gladiaClient?.destroy(); } catch {}
+    try { session.sttClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
     activeSessions.delete(session.voiceChannel.id);
@@ -270,8 +269,8 @@ async function performStopMeeting(session) {
   // 0. 먼저 세션을 맵에서 제거하여 중복 종료 및 voiceStateUpdate 간섭 방지
   activeSessions.delete(session.voiceChannel.id);
 
-  // 1. Gladia에 stop_recording 전송
-  await session.gladiaClient.stopRecording();
+  // 1. STT 녹음 중단
+  await session.sttClient.stopRecording();
 
   // 2. 음성 스트림 중단
   session.voiceHandler.destroy();
@@ -309,8 +308,8 @@ async function performStopMeeting(session) {
     textChannel: session.textChannel,
   });
 
-  // 8. Gladia 정리
-  session.gladiaClient.destroy();
+  // 8. STT 정리
+  session.sttClient.destroy();
 
   // 9. 세션 제거 (이미 0단계에서 제거됨, 안전을 위한 중복 호출)
   activeSessions.delete(session.voiceChannel.id);
@@ -422,7 +421,7 @@ function setAutoStopTimer(channelId) {
       console.error('[Main] 자동 종료 실패:', err);
       // 강제 정리
       try { session.voiceHandler?.destroy(); } catch {}
-      try { session.gladiaClient?.destroy(); } catch {}
+      try { session.sttClient?.destroy(); } catch {}
       try { session.transcriptManager?.destroy(); } catch {}
       try { session.chatCollector?.destroy(); } catch {}
       activeSessions.delete(channelId);
@@ -527,7 +526,7 @@ process.on('SIGINT', () => {
   for (const [channelId, session] of activeSessions) {
     clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
-    try { session.gladiaClient?.destroy(); } catch {}
+    try { session.sttClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
   }
@@ -541,7 +540,7 @@ process.on('SIGTERM', () => {
   for (const [channelId, session] of activeSessions) {
     clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
-    try { session.gladiaClient?.destroy(); } catch {}
+    try { session.sttClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
   }

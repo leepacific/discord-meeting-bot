@@ -27,7 +27,7 @@ export class TranscriptManager {
 
   /**
    * 화자(채널) 이름 설정
-   * @param {number} channel - Gladia 채널 번호
+   * @param {number} channel - 오디오 채널 번호
    * @param {string} name - 디스코드 유저 이름
    */
   setSpeakerName(channel, name) {

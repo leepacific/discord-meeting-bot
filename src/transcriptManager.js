@@ -141,13 +141,13 @@ export class TranscriptManager {
   /**
    * 리소스 정리
    */
-  destroy() {
+  async destroy() {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
-    // 남은 버퍼 전송
-    this._flush();
+    // 남은 버퍼 전송 (완료 대기 후 textChannel 해제)
+    await this._flush();
     this.textChannel = null;
   }
 }

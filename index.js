@@ -297,7 +297,7 @@ async function performStopMeeting(session) {
   stats.chatMessageCount = session.chatCollector.messageCount;
 
   // 5. 전사 매니저 및 채팅 수집기 정리
-  session.transcriptManager.destroy();
+  await session.transcriptManager.destroy();
   session.chatCollector.destroy();
 
   // 6. LLM 통합 요약 생성 (음성 전사 + 채팅)
@@ -507,7 +507,8 @@ client.on('interactionCreate', async (interaction) => {
 // ── 음성 상태 변경 감지 (자동 종료용) ──
 client.on('voiceStateUpdate', (oldState, newState) => {
   // 봇 자신의 이벤트는 무시 (destroy 시 voiceStateUpdate 발생 방지)
-  if (oldState.member?.user?.bot || newState.member?.user?.bot) return;
+  const userId = oldState.id || newState.id;
+  if (userId === client.user?.id) return;
 
   const leftChannelId = oldState.channelId;
   const joinedChannelId = newState.channelId;
@@ -541,8 +542,8 @@ process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
 });
 
-process.on('SIGINT', () => {
-  console.log('종료 신호 수신, 정리 중...');
+function gracefulShutdown(signal) {
+  console.log(`${signal} 수신, 정리 중...`);
   for (const [channelId, session] of activeSessions) {
     clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
@@ -557,25 +558,10 @@ process.on('SIGINT', () => {
   activeSessions.clear();
   client.destroy();
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM 수신, 정리 중...');
-  for (const [channelId, session] of activeSessions) {
-    clearAutoStopTimer(channelId);
-    try { session.voiceHandler?.destroy(); } catch {}
-    if (session.sttClients) {
-      for (const [, userStt] of session.sttClients) {
-        try { userStt.destroy(); } catch {}
-      }
-    }
-    try { session.transcriptManager?.destroy(); } catch {}
-    try { session.chatCollector?.destroy(); } catch {}
-  }
-  activeSessions.clear();
-  client.destroy();
-  process.exit(0);
-});
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // ── 봇 시작 ──
 client.login(config.discordToken);

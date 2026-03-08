@@ -129,15 +129,18 @@ export class ElevenLabsClient {
     if (this.destroyed) return;
 
     try {
+      // 기존 WS 정리 (리스너 포함)
       if (this.ws) {
+        this.ws.removeAllListeners();
         try { this.ws.close(1000); } catch {}
         this.ws = null;
       }
+      this.isConnected = false;
 
       console.log(`[ElevenLabs:${this.label}] 재연결 시도...`);
       await this.initSession();
       this.connect();
-      console.log(`[ElevenLabs:${this.label}] 재연결 성공`);
+      // 실제 연결 완료는 ws 'open' 이벤트에서 로그됨
     } catch (err) {
       console.error(`[ElevenLabs:${this.label}] 재연결 실패:`, err.message);
       this.onError(err);
@@ -250,7 +253,8 @@ export class ElevenLabsClient {
       case 'session_time_limit_exceeded': {
         console.warn(`[ElevenLabs:${this.label}] 세션 시간 제한 초과, 새 세션으로 재연결...`);
         this.onError(new Error('ElevenLabs 세션 시간 초과'));
-        // 자동 재연결
+        // 자동 재연결 — _reconnect에서 기존 WS 리스너를 제거하므로
+        // close 이벤트에 의한 중복 재연결이 발생하지 않음
         if (!this.destroyed) {
           this._reconnect();
         }
@@ -330,10 +334,16 @@ export class ElevenLabsClient {
       }
 
       // 커밋 응답 대기 후 종료 (2초 대기)
+      const wsRef = this.ws;
       setTimeout(() => {
         try {
-          this.ws.close(1000);
+          wsRef.close(1000);
         } catch {}
+        // stopRecording 완료 후 ws 참조 정리 (destroy 이중 close 방지)
+        if (this.ws === wsRef) {
+          this.ws = null;
+          this.isConnected = false;
+        }
       }, 2000);
 
       // 타임아웃 안전장치 (10초)

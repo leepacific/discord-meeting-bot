@@ -60,6 +60,7 @@ export class ElevenLabsClient {
       commit_strategy: config.elevenlabs.commitStrategy,
       vad_silence_threshold_secs: String(config.elevenlabs.vadSilenceThresholdSecs),
       vad_threshold: String(config.elevenlabs.vadThreshold),
+      include_timestamps: 'true',  // 단어별 타임스탬프 활성화 (정확한 발화 시점 기록용)
     });
 
     // VAD 안정화 파라미터 (잡음/짧은 소리 오인식 방지)
@@ -102,6 +103,8 @@ export class ElevenLabsClient {
       console.log(`[ElevenLabs:${this.label}] WebSocket 연결 완료`);
       this.isConnected = true;
       this.reconnectAttempts = 0;
+      // STT 세션 연결 시점 기록 (words[].start는 이 시점 기준 경과 시간)
+      this.sttConnectedAt = Date.now();
       this._startKeepAlive();
     });
 
@@ -225,44 +228,69 @@ export class ElevenLabsClient {
       }
 
       case 'committed_transcript': {
+        // include_timestamps=true일 때 committed_transcript_with_timestamps가 별도로 도착하므로
+        // committed_transcript는 폴백으로만 처리 (committed_transcript_with_timestamps 미도착 시 대비)
         const text = message.text;
         if (!text || text.trim().length === 0) break;
 
-        // 재연결 시 previous_text로 사용하기 위해 마지막 커밋 텍스트 저장 (최대 50자)
         this.lastCommittedText = text.trim().slice(-50);
 
-        // 회의 시작 시점 기준 경과 시간(초)
-        const elapsedSec = (Date.now() - this.meetingStartTime) / 1000;
+        // committed_transcript_with_timestamps가 도착하지 않을 경우에만 전송 (500ms 대기)
+        // 도착하면 _lastTimestampedId로 중복 방지
+        const fallbackId = `el-${Date.now()}`;
+        this._pendingCommit = { text: text.trim(), id: fallbackId };
 
-        this.onTranscript({
-          text: text.trim(),
-          channel: 0,        // ElevenLabs는 단일 채널
-          speaker: null,     // 화자 구분은 voiceHandler의 SSRC 매핑으로 처리
-          language: config.elevenlabs.languageCode || null,
-          start: elapsedSec,
-          end: elapsedSec,
-          id: `el-${Date.now()}`,
-        });
+        setTimeout(() => {
+          if (this._pendingCommit && this._pendingCommit.id === fallbackId) {
+            // committed_transcript_with_timestamps가 500ms 이내 도착하지 않음 → 폴백 전송
+            const elapsedSec = (Date.now() - this.meetingStartTime) / 1000;
+            this.onTranscript({
+              text: this._pendingCommit.text,
+              channel: 0,
+              speaker: null,
+              language: config.elevenlabs.languageCode || null,
+              start: elapsedSec,
+              end: elapsedSec,
+              id: fallbackId,
+            });
+            this._pendingCommit = null;
+          }
+        }, 500);
         break;
       }
 
       case 'committed_transcript_with_timestamps': {
-        // 타임스탬프 포함 전사 (include_timestamps=true 시)
-        const text = message.text;
-        if (!text || text.trim().length === 0) break;
+        // 단어별 타임스탬프 포함 전사 (include_timestamps=true)
+        // words[0].start로 실제 발화 시점을 정확히 기록
+        const text2 = message.text;
+        if (!text2 || text2.trim().length === 0) break;
 
-        // 재연결 시 previous_text로 사용하기 위해 마지막 커밋 텍스트 저장
-        this.lastCommittedText = text.trim().slice(-50);
+        this.lastCommittedText = text2.trim().slice(-50);
 
-        const elapsedSec2 = (Date.now() - this.meetingStartTime) / 1000;
+        // pending commit 클리어 (중복 전송 방지)
+        this._pendingCommit = null;
+
+        // words[0].start = STT 세션 내 오디오 스트림 기준 발화 시작 시점(초)
+        // 회의 기준 경과 시간 = (sttConnectedAt - meetingStartTime)/1000 + words[0].start
+        const words = message.words || [];
+        const firstWordStart = words.length > 0 ? (words[0].start || 0) : 0;
+        const lastWordEnd = words.length > 0 ? (words[words.length - 1].end || firstWordStart) : firstWordStart;
+
+        // STT 세션 연결 시점부터 회의 시작까지의 오프셋(초)
+        const sttOffsetSec = ((this.sttConnectedAt || this.meetingStartTime) - this.meetingStartTime) / 1000;
+
+        const startSec = sttOffsetSec + firstWordStart;
+        const endSec = sttOffsetSec + lastWordEnd;
+
+        console.log(`[ElevenLabs:${this.label}] 타임스탬프 전사: words[0].start=${firstWordStart.toFixed(2)}s, sttOffset=${sttOffsetSec.toFixed(2)}s, 회의기준=${startSec.toFixed(2)}s`);
 
         this.onTranscript({
-          text: text.trim(),
+          text: text2.trim(),
           channel: 0,
           speaker: null,
           language: message.language_code || config.elevenlabs.languageCode || null,
-          start: elapsedSec2,
-          end: elapsedSec2,
+          start: startSec,
+          end: endSec,
           id: `el-${Date.now()}`,
         });
         break;

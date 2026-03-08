@@ -185,12 +185,12 @@ export class VoiceHandler {
   /**
    * 무음 재생 — Discord의 오디오 수신 파이프라인 활성화
    * Discord는 봇이 무엇이라도 재생해야 오디오 수신이 정상 동작함
-   * setInterval로 250ms마다 무음 Opus 프레임을 지속적으로 공급
+   * read() 안에서 즉시 무음 Opus 프레임을 push하여 AudioPlayer가 Idle로 전환되지 않도록 함
    */
   _startSilencePlayer() {
     if (!this.connection || this.destroyed) return;
 
-    // 기존 플레이어 및 타이머 정리 (재시작 시 중복 방지)
+    // 기존 플레이어 정리 (재시작 시 중복 방지)
     this._stopSilencePlayer();
 
     try {
@@ -199,27 +199,15 @@ export class VoiceHandler {
       // 무음 Opus 프레임 (0xF8, 0xFF, 0xFE = Opus silence frame)
       const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
 
-      // setInterval로 지속적으로 무음 프레임을 공급하는 Readable 스트림
-      // 기존 setTimeout 방식은 read()마다 1회만 push하여 버퍼가 즉시 비고
-      // AudioPlayer가 Idle로 전환 → 재시작 루프(0.5초)가 발생했음
+      // read()에서 즉시 push하는 무한 무음 스트림
+      // AudioPlayer가 데이터를 요청할 때마다(read 호출) 즉시 1프레임 제공
+      // → 내부 버퍼가 비지 않아 Idle로 전환되지 않음
+      // Node.js Readable: push 성공 시 highWaterMark까지 read() 재호출 → 자동 속도 조절
       const silenceStream = new Readable({
-        read() {}, // setInterval이 push를 담당하므로 read()는 비워둠
+        read() {
+          this.push(SILENCE_FRAME);
+        },
       });
-
-      // 250ms 간격으로 무음 프레임 연속 공급
-      this._silenceInterval = setInterval(() => {
-        if (this.destroyed) {
-          clearInterval(this._silenceInterval);
-          this._silenceInterval = null;
-          return;
-        }
-        try {
-          // push가 false를 반환하면 backpressure — 다음 interval에서 재시도
-          silenceStream.push(SILENCE_FRAME);
-        } catch {
-          // 스트림이 이미 destroyed된 경우 무시
-        }
-      }, 250);
 
       const resource = createAudioResource(silenceStream, {
         inputType: StreamType.Opus,
@@ -236,7 +224,7 @@ export class VoiceHandler {
         }
       });
 
-      // Idle 전환 시 한 번만 재시작 (무한 루프 방지용 3초 딜레이)
+      // Idle 전환 시 재시작 (read()에서 즉시 push하므로 정상적으로는 발생하지 않음)
       this.silencePlayer.on(AudioPlayerStatus.Idle, () => {
         if (!this.destroyed) {
           console.warn('[Voice] 무음 플레이어 예기치 않게 idle 전환, 3초 후 재시작');
@@ -254,13 +242,9 @@ export class VoiceHandler {
   }
 
   /**
-   * 무음 플레이어 및 관련 타이머 정리
+   * 무음 플레이어 정리
    */
   _stopSilencePlayer() {
-    if (this._silenceInterval) {
-      clearInterval(this._silenceInterval);
-      this._silenceInterval = null;
-    }
     if (this.silencePlayer) {
       try { this.silencePlayer.removeAllListeners(); } catch {}
       try { this.silencePlayer.stop(true); } catch {}
@@ -421,10 +405,6 @@ export class VoiceHandler {
     if (this.daveReadyTimer) {
       clearTimeout(this.daveReadyTimer);
       this.daveReadyTimer = null;
-    }
-    if (this._silenceInterval) {
-      clearInterval(this._silenceInterval);
-      this._silenceInterval = null;
     }
   }
 

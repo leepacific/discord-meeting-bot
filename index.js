@@ -29,6 +29,9 @@ const client = new Client({
 // ── 채널별 활성 세션 관리 (서버 내 다중 채널 동시 지원) ──
 const activeSessions = new Map(); // channelId → session
 
+// ── 자동 종료 타이머 관리 ──
+const autoStopTimers = new Map(); // channelId → timer
+
 /**
  * 회의 세션 시작
  */
@@ -107,13 +110,38 @@ async function startMeeting(interaction) {
       onUserLeave: (userId) => {
         console.log(`[Main] 유저 퇴장: ${userId}`);
       },
+      onForceDisconnect: () => {
+        // 봇이 킥/강제퇴장된 경우 세션 정리
+        handleForceDisconnect(voiceChannel.id);
+      },
     });
 
     // 1. 음성 채널 접속과 Gladia 세션 초기화를 병렬로 실행 (첨 전사 속도 향상)
-    const [, gladiaSession] = await Promise.all([
-      voiceHandler.join(voiceChannel),
-      gladiaClient.initSession(),
-    ]);
+    //    한쪽이 실패해도 양쪽 모두 정리되도록 처리
+    let voiceJoined = false;
+    let gladiaInited = false;
+
+    try {
+      const results = await Promise.allSettled([
+        voiceHandler.join(voiceChannel),
+        gladiaClient.initSession(),
+      ]);
+
+      if (results[0].status === 'rejected') {
+        throw new Error(`음성 채널 접속 실패: ${results[0].reason?.message || results[0].reason}`);
+      }
+      voiceJoined = true;
+
+      if (results[1].status === 'rejected') {
+        throw new Error(`Gladia 세션 초기화 실패: ${results[1].reason?.message || results[1].reason}`);
+      }
+      gladiaInited = true;
+    } catch (initErr) {
+      // 한쪽만 성공한 경우 성공한 쪽 정리
+      if (voiceJoined) try { voiceHandler.destroy(); } catch {}
+      if (gladiaInited) try { gladiaClient.destroy(); } catch {}
+      throw initErr;
+    }
 
     // 2. 양쪽 모두 성공하면 Gladia WebSocket 연결
     gladiaClient.connect();
@@ -159,6 +187,33 @@ async function startMeeting(interaction) {
 }
 
 /**
+ * 봇이 킥/강제퇴장된 경우 세션 정리
+ */
+function handleForceDisconnect(channelId) {
+  const session = activeSessions.get(channelId);
+  if (!session) return;
+
+  console.log(`[Main] 강제 퇴장 감지, 세션 정리: ${channelId}`);
+
+  // 자동 종료 타이머가 있으면 제거
+  clearAutoStopTimer(channelId);
+
+  // Gladia 정리
+  try { session.gladiaClient?.destroy(); } catch {}
+
+  // 전사 매니저 정리 (남은 버퍼 전송)
+  try { session.transcriptManager?.destroy(); } catch {}
+
+  // 세션 제거
+  activeSessions.delete(channelId);
+
+  // 텍스트 채널에 알림
+  try {
+    session.textChannel?.send('⚠️ 봇이 음성 채널에서 제거되어 회의 기록이 중단되었습니다.');
+  } catch {}
+}
+
+/**
  * 회의 세션 종료
  */
 async function stopMeeting(interaction) {
@@ -178,65 +233,14 @@ async function stopMeeting(interaction) {
 
   await interaction.deferReply();
 
+  // 자동 종료 타이머 제거
+  clearAutoStopTimer(session.voiceChannel.id);
+
   try {
     await interaction.editReply('⏳ 회의를 종료하고 요약을 생성하는 중...');
 
-    // 1. 먼저 Gladia에 stop_recording 전송 (후처리 트리거)
-    //    이때 아직 voice는 살아있어서 마지막 버퍼가 전송될 수 있음
-    const stopResult = await session.gladiaClient.stopRecording();
-
-    // 2. 음성 스트림 중단
-    session.voiceHandler.destroy();
-
-    // 3. WebSocket으로 요약이 수신되지 않았으면 REST API로 폴백 조회
-    let summary = session.getSummary();
-
-    if (!summary && stopResult && !stopResult.summaryReceived) {
-      console.log('[Main] WebSocket으로 요약 미수신, REST API 폴백 시도...');
-
-      // Gladia 후처리 완료까지 폴링 (최대 3회, 5초 간격)
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        console.log(`[Main] REST API 요약 조회 시도 ${attempt}/3...`);
-
-        try {
-          const results = await session.gladiaClient.getSessionResults();
-
-          // REST API 응답 구조: result.summarization (post_processing 아님)
-          const summaryData = results?.result?.summarization;
-          if (summaryData && summaryData.success && !summaryData.is_empty) {
-            summary = summaryData;
-            console.log('[Main] REST API로 요약 획득 성공');
-            break;
-          } else {
-            console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt}), status: ${results?.status}, summarization: ${JSON.stringify(summaryData?.success ?? null)}`);
-          }
-        } catch (err) {
-          console.error(`[Main] REST API 요약 조회 실패 (attempt ${attempt}):`, err.message);
-        }
-      }
-    }
-
-    // 4. 통계 및 전사록 수집 (destroy 전에)
-    const stats = session.transcriptManager.getStats();
-    const fullTranscript = session.transcriptManager.getFullTranscript();
-
-    // 5. 전사 매니저 정리 (남은 버퍼 전송)
-    session.transcriptManager.destroy();
-
-    // 6. 요약 전송
-    await SummaryGenerator.send({
-      summary,
-      stats,
-      fullTranscript,
-      textChannel: session.textChannel,
-    });
-
-    // 7. Gladia 정리
-    session.gladiaClient.destroy();
-
-    // 8. 세션 제거
-    activeSessions.delete(session.voiceChannel.id);
+    // 공통 종료 로직 호출
+    await performStopMeeting(session);
 
     await interaction.editReply('✅ 회의 기록이 종료되었습니다. 아래 요약 노트를 확인하세요.');
 
@@ -250,6 +254,67 @@ async function stopMeeting(interaction) {
 
     await interaction.editReply(`❌ 종료 중 오류 발생: ${err.message}`);
   }
+}
+
+/**
+ * 공통 회의 종료 로직 (수동 종료 + 자동 종료에서 공유)
+ */
+async function performStopMeeting(session) {
+  // 1. 먼저 Gladia에 stop_recording 전송 (후처리 트리거)
+  const stopResult = await session.gladiaClient.stopRecording();
+
+  // 2. 음성 스트림 중단
+  session.voiceHandler.destroy();
+
+  // 3. WebSocket으로 요약이 수신되지 않았으면 REST API로 폴백 조회
+  let summary = session.getSummary();
+
+  if (!summary && stopResult && !stopResult.summaryReceived) {
+    console.log('[Main] WebSocket으로 요약 미수신, REST API 폴백 시도...');
+
+    // Gladia 후처리 완료까지 폴링 (최대 3회, 5초 간격)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      console.log(`[Main] REST API 요약 조회 시도 ${attempt}/3...`);
+
+      try {
+        const results = await session.gladiaClient.getSessionResults();
+
+        // REST API 응답 구조: result.summarization (post_processing 아님)
+        const summaryData = results?.result?.summarization;
+        if (summaryData && summaryData.success && !summaryData.is_empty) {
+          summary = summaryData;
+          console.log('[Main] REST API로 요약 획득 성공');
+          break;
+        } else {
+          console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt}), status: ${results?.status}, summarization: ${JSON.stringify(summaryData?.success ?? null)}`);
+        }
+      } catch (err) {
+        console.error(`[Main] REST API 요약 조회 실패 (attempt ${attempt}):`, err.message);
+      }
+    }
+  }
+
+  // 4. 통계 및 전사록 수집 (destroy 전에)
+  const stats = session.transcriptManager.getStats();
+  const fullTranscript = session.transcriptManager.getFullTranscript();
+
+  // 5. 전사 매니저 정리 (남은 버퍼 전송)
+  session.transcriptManager.destroy();
+
+  // 6. 요약 전송
+  await SummaryGenerator.send({
+    summary,
+    stats,
+    fullTranscript,
+    textChannel: session.textChannel,
+  });
+
+  // 7. Gladia 정리
+  session.gladiaClient.destroy();
+
+  // 8. 세션 제거
+  activeSessions.delete(session.voiceChannel.id);
 }
 
 /**
@@ -334,13 +399,59 @@ function getGuildSessions(guildId) {
   return sessions;
 }
 
+// ── 자동 종료: 봇만 남으면 2분 후 자동 종료 ──
+
+/**
+ * 자동 종료 타이머 설정
+ */
+function setAutoStopTimer(channelId) {
+  // 기존 타이머 제거
+  clearAutoStopTimer(channelId);
+
+  const AUTO_STOP_DELAY_MS = 120_000; // 2분
+
+  const timer = setTimeout(async () => {
+    autoStopTimers.delete(channelId);
+    const session = activeSessions.get(channelId);
+    if (!session) return;
+
+    console.log(`[Main] 자동 종료 실행: ${channelId}`);
+    try {
+      await session.textChannel?.send('⏹️ 음성 채널에 참가자가 없어 회의 기록을 자동 종료합니다.');
+      await performStopMeeting(session);
+    } catch (err) {
+      console.error('[Main] 자동 종료 실패:', err);
+      // 강제 정리
+      try { session.voiceHandler?.destroy(); } catch {}
+      try { session.gladiaClient?.destroy(); } catch {}
+      try { session.transcriptManager?.destroy(); } catch {}
+      activeSessions.delete(channelId);
+    }
+  }, AUTO_STOP_DELAY_MS);
+
+  autoStopTimers.set(channelId, timer);
+  console.log(`[Main] 자동 종료 타이머 설정 (2분): ${channelId}`);
+}
+
+/**
+ * 자동 종료 타이머 해제
+ */
+function clearAutoStopTimer(channelId) {
+  const timer = autoStopTimers.get(channelId);
+  if (timer) {
+    clearTimeout(timer);
+    autoStopTimers.delete(channelId);
+    console.log(`[Main] 자동 종료 타이머 해제: ${channelId}`);
+  }
+}
+
 // ── 이벤트 핸들러 ──
 
 client.once(Events.ClientReady, () => {
   console.log(`✅ 봇 로그인 완료: ${client.user.tag}`);
   console.log(`   서버 수: ${client.guilds.cache.size}`);
   console.log(`   Node.js: ${process.version}`);
-  // 의존성 보고서 출력 (디버깅용)
+  // 의존성 보고서 출력
   console.log('[Dependencies]\n' + generateDependencyReport());
 });
 
@@ -374,6 +485,40 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// ── 음성 상태 변경 감지 (자동 종료용) ──
+client.on('voiceStateUpdate', (oldState, newState) => {
+  // 누군가 음성 채널을 나갔을 때만 체크
+  const leftChannelId = oldState.channelId;
+  if (!leftChannelId) return;
+  if (leftChannelId === newState.channelId) return; // 같은 채널 내 변경 (뮤트 등) 무시
+
+  // 해당 채널에 활성 세션이 있는지 확인
+  if (!activeSessions.has(leftChannelId)) return;
+
+  // 채널에 남은 인원 확인 (봇 제외)
+  const channel = oldState.guild.channels.cache.get(leftChannelId);
+  if (!channel) return;
+
+  const humanMembers = channel.members.filter(m => !m.user.bot);
+  if (humanMembers.size === 0) {
+    // 봇만 남음 → 자동 종료 타이머 시작
+    setAutoStopTimer(leftChannelId);
+  }
+});
+
+// 누군가 음성 채널에 (재)입장하면 자동 종료 타이머 취소
+client.on('voiceStateUpdate', (oldState, newState) => {
+  const joinedChannelId = newState.channelId;
+  if (!joinedChannelId) return;
+  if (joinedChannelId === oldState.channelId) return; // 같은 채널 내 변경 무시
+
+  // 해당 채널에 자동 종료 타이머가 설정되어 있으면 해제
+  if (autoStopTimers.has(joinedChannelId) && !newState.member?.user?.bot) {
+    console.log(`[Main] 참가자 입장으로 자동 종료 취소: ${joinedChannelId}`);
+    clearAutoStopTimer(joinedChannelId);
+  }
+});
+
 // ── 에러 핸들링 ──
 
 process.on('unhandledRejection', (err) => {
@@ -382,7 +527,8 @@ process.on('unhandledRejection', (err) => {
 
 process.on('SIGINT', () => {
   console.log('종료 신호 수신, 정리 중...');
-  for (const [, session] of activeSessions) {
+  for (const [channelId, session] of activeSessions) {
+    clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
     try { session.gladiaClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}
@@ -394,7 +540,8 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   console.log('SIGTERM 수신, 정리 중...');
-  for (const [, session] of activeSessions) {
+  for (const [channelId, session] of activeSessions) {
+    clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
     try { session.gladiaClient?.destroy(); } catch {}
     try { session.transcriptManager?.destroy(); } catch {}

@@ -106,17 +106,42 @@ export class GladiaClient {
 
       if (this.destroyed) return;
 
-      // 정상 종료 (1000) 가 아닌 경우 재연결 시도
-      if (code !== 1000 && this.wsUrl && this.reconnectAttempts < this.maxReconnectAttempts) {
+      // 정상 종료 (1000) 가 아닌 경우 새 세션으로 재연결 시도
+      // Gladia는 세션 종료(4408/4504 등) 후 같은 URL로 재연결 불가 → initSession()부터 다시
+      if (code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.reconnectAttempts++;
-        const delay = Math.min(5000 * this.reconnectAttempts, 30000); // 점진적 대기 (5s, 10s, 15s, 20s, 25s)
-        console.log(`[Gladia] ${delay / 1000}초 후 재연결 시도 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
-        this.reconnectTimer = setTimeout(() => this.connect(), delay);
+        const delay = Math.min(5000 * this.reconnectAttempts, 30000);
+        console.log(`[Gladia] ${delay / 1000}초 후 새 세션으로 재연결 시도 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+        this.reconnectTimer = setTimeout(() => this._reconnectWithNewSession(), delay);
       } else if (code !== 1000) {
         console.error(`[Gladia] 재연결 최대 횟수 초과 (code: ${code})`);
         this.onError(new Error(`Gladia WebSocket 재연결 실패 (code: ${code})`));
       }
     });
+  }
+
+  /**
+   * 새 세션으로 재연결 (initSession + connect)
+   * 비정상 종료(4408, 4504 등) 후 기존 wsUrl은 사용 불가하므로 새 세션 생성
+   */
+  async _reconnectWithNewSession() {
+    if (this.destroyed) return;
+
+    try {
+      // 기존 WS 정리
+      if (this.ws) {
+        try { this.ws.close(1000); } catch {}
+        this.ws = null;
+      }
+
+      console.log('[Gladia] 새 세션 생성 시도...');
+      await this.initSession();
+      this.connect();
+      console.log('[Gladia] 새 세션으로 재연결 성공');
+    } catch (err) {
+      console.error('[Gladia] 새 세션 재연결 실패:', err.message);
+      this.onError(err);
+    }
   }
 
   /**

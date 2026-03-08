@@ -2,7 +2,7 @@
   "name": "discord-meeting-bot",
   "version": "1.0.0",
   "type": "module",
-  "description": "Discord 라이브 회의 노트 테이킹 봇 - Gladia 실시간 STT API 기반",
+  "description": "Discord 라이브 회의 노트 테이킹 봇 - ElevenLabs Scribe v2 Realtime STT 기반",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

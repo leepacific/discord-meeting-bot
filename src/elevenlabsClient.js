@@ -180,8 +180,10 @@ export class ElevenLabsClient {
       }
 
       case 'partial_transcript': {
-        // 부분 전사 — 로그만 (실시간 채팅 표시용으로 활용 가능)
-        // 최종 전사(committed_transcript)만 onTranscript으로 전달
+        // 부분 전사 — 로그 (디버깅용)
+        if (message.text && message.text.trim().length > 0) {
+          console.log(`[ElevenLabs] 부분 전사: "${message.text.trim()}"`);
+        }
         break;
       }
 
@@ -260,6 +262,13 @@ export class ElevenLabsClient {
   sendAudio(audioBuffer) {
     if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return;
+    }
+
+    // 오디오 전송 통계 (처음 10회만 로그)
+    if (!this._sendCount) this._sendCount = 0;
+    this._sendCount++;
+    if (this._sendCount <= 10 || this._sendCount % 100 === 0) {
+      console.log(`[ElevenLabs] 오디오 전송 #${this._sendCount}: ${audioBuffer.length} bytes`);
     }
 
     // ElevenLabs는 JSON 메시지로 base64 인코딩된 오디오를 전송

@@ -152,7 +152,7 @@ export class ElevenLabsClient {
       // 마지막 오디오 전송 후 25초 이상 경과한 경우만 무음 전송
       if (Date.now() - this.lastAudioSent > 25000) {
         this.ws.send(JSON.stringify({
-          type: 'input_audio_chunk',
+          message_type: 'input_audio_chunk',
           audio_base_64: SILENCE_BASE64,
         }));
       }
@@ -170,7 +170,8 @@ export class ElevenLabsClient {
    * ElevenLabs 서버 메시지 처리
    */
   _handleMessage(message) {
-    const { type } = message;
+    // ElevenLabs는 message_type 필드를 사용
+    const type = message.message_type || message.type;
 
     switch (type) {
       case 'session_started': {
@@ -230,7 +231,7 @@ export class ElevenLabsClient {
       case 'insufficient_audio_activity':
       case 'unaccepted_terms':
       case 'commit_throttled': {
-        const errorMsg = message.message || message.error || type;
+        const errorMsg = message.error || message.message || type;
         console.error(`[ElevenLabs] 서버 오류 (${type}):`, errorMsg);
         this.onError(new Error(`ElevenLabs ${type}: ${errorMsg}`));
         break;
@@ -247,7 +248,7 @@ export class ElevenLabsClient {
       }
 
       default:
-        console.log(`[ElevenLabs] 알 수 없는 메시지 타입: ${type}`, JSON.stringify(message).slice(0, 200));
+        console.log(`[ElevenLabs] 알 수 없는 메시지 타입: ${type}`, JSON.stringify(message).slice(0, 300));
         break;
     }
   }
@@ -263,7 +264,7 @@ export class ElevenLabsClient {
 
     // ElevenLabs는 JSON 메시지로 base64 인코딩된 오디오를 전송
     this.ws.send(JSON.stringify({
-      type: 'input_audio_chunk',
+      message_type: 'input_audio_chunk',
       audio_base_64: audioBuffer.toString('base64'),
     }));
     this.lastAudioSent = Date.now();

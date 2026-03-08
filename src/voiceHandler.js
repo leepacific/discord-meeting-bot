@@ -17,8 +17,8 @@ import prism from 'prism-media';
  *       @snazzah/davey 패키지가 node_modules에 있으면 자동으로 DAVE 활성화됨
  */
 export class VoiceHandler {
-  constructor({ onAudioData, onUserJoin, onUserLeave, onForceDisconnect }) {
-    this.onAudioData = onAudioData || (() => {});
+  constructor({ onUserAudioData, onUserJoin, onUserLeave, onForceDisconnect }) {
+    this.onUserAudioData = onUserAudioData || (() => {});  // (userId, buffer)
     this.onUserJoin = onUserJoin || (() => {});
     this.onUserLeave = onUserLeave || (() => {});
     this.onForceDisconnect = onForceDisconnect || (() => {});
@@ -51,16 +51,25 @@ export class VoiceHandler {
       selfMute: true,   // 봇은 말하지 않음
       // DAVE E2EE 활성화 (@snazzah/davey가 자동으로 핸드셰이크 처리)
       daveEncryption: true,
-      // 복호화 실패 허용 횟수 - DAVE 전환 과정 중 일시적 실패 대비
-      decryptionFailureTolerance: 100,
+      // 복호화 실패 허용 횟수 - DAVE 키 전환(rotation) 중 일시적 실패 대비
+      decryptionFailureTolerance: 500,
       // debug 플래그 유지 (오디오 수신 안정성에 필요)
       debug: true,
     });
 
-    // 디버그 로그 (에러/경고만 출력, 나머지는 묵음)
+    // 디버그 로그 (에러/경고만 출력, DAVE 복호화 실패는 10회 이상 연속 시에만)
+    let consecutiveDecryptFails = 0;
     this.connection.on('debug', (msg) => {
-      if (msg.includes('Failed to decrypt') || msg.includes('error') || msg.includes('Error')) {
-        console.log(`[Voice:debug] ${msg.substring(0, 300)}`);
+      if (msg.includes('Failed to decrypt')) {
+        consecutiveDecryptFails++;
+        if (consecutiveDecryptFails === 10 || consecutiveDecryptFails % 50 === 0) {
+          console.warn(`[Voice:DAVE] 복호화 실패 ${consecutiveDecryptFails}회 연속`);
+        }
+      } else {
+        if (consecutiveDecryptFails > 0) consecutiveDecryptFails = 0;
+        if (msg.includes('error') || msg.includes('Error')) {
+          console.log(`[Voice:debug] ${msg.substring(0, 300)}`);
+        }
       }
     });
 
@@ -338,29 +347,25 @@ export class VoiceHandler {
   }
 
   /**
-   * 주기적 오디오 믹싱 및 전송
-   * 모든 유저의 오디오를 모노로 믹스다운하여 단일 채널로 전송
+   * 주기적 유저별 오디오 전송
+   * 각 유저의 오디오를 개별적으로 콜백 전달 (믹스다운 하지 않음)
    */
   _startMixing() {
-    const MIX_INTERVAL_MS = 100; // 100ms 단위로 전송
+    const FLUSH_INTERVAL_MS = 100; // 100ms 단위로 전송
 
     this.mixInterval = setInterval(() => {
       if (this.destroyed) return;
 
-      const allChunks = [];
-      for (const [, chunks] of this.userBuffers) {
-        if (chunks.length > 0) {
-          allChunks.push(...chunks.splice(0));
+      for (const [userId, chunks] of this.userBuffers) {
+        if (chunks.length === 0) continue;
+
+        const userChunks = chunks.splice(0);
+        const combined = Buffer.concat(userChunks);
+        if (combined.length > 0) {
+          this.onUserAudioData(userId, combined);
         }
       }
-
-      if (allChunks.length === 0) return;
-
-      const combined = Buffer.concat(allChunks);
-      if (combined.length > 0) {
-        this.onAudioData(combined);
-      }
-    }, MIX_INTERVAL_MS);
+    }, FLUSH_INTERVAL_MS);
   }
 
   /**

@@ -11,10 +11,18 @@ import config from './config.js';
  *   initSession(), connect(), sendAudio(), stopRecording(), destroy()
  */
 export class ElevenLabsClient {
-  constructor({ onTranscript, onError, onSessionEnd }) {
+  /**
+   * @param {object} opts
+   * @param {Function} opts.onTranscript - 전사 결과 콜백
+   * @param {Function} opts.onError - 오류 콜백
+   * @param {Function} opts.onSessionEnd - 세션 종료 콜백
+   * @param {string}   [opts.label] - 로그 식별자 (예: 유저 이름)
+   */
+  constructor({ onTranscript, onError, onSessionEnd, label }) {
     this.onTranscript = onTranscript || (() => {});
     this.onError = onError || (() => {});
     this.onSessionEnd = onSessionEnd || (() => {});
+    this.label = label || 'default';
     this.ws = null;
     this.sessionId = null;
     this.isConnected = false;
@@ -52,7 +60,7 @@ export class ElevenLabsClient {
     this.wsUrl = `${config.elevenlabs.wsUrl}?${params.toString()}`;
     this.sessionId = `el-${Date.now()}`;
 
-    console.log(`[ElevenLabs] 세션 준비 완료: ${this.sessionId}`);
+    console.log(`[ElevenLabs:${this.label}] 세션 준비 완료: ${this.sessionId}`);
     return { sessionId: this.sessionId, wsUrl: this.wsUrl };
   }
 
@@ -65,7 +73,7 @@ export class ElevenLabsClient {
     }
     if (this.destroyed) return;
 
-    console.log('[ElevenLabs] WebSocket 연결 중...');
+    console.log(`[ElevenLabs:${this.label}] WebSocket 연결 중...`);
     this.ws = new WebSocket(this.wsUrl, {
       headers: {
         'xi-api-key': config.elevenlabsApiKey,
@@ -73,7 +81,7 @@ export class ElevenLabsClient {
     });
 
     this.ws.on('open', () => {
-      console.log('[ElevenLabs] WebSocket 연결 완료');
+      console.log(`[ElevenLabs:${this.label}] WebSocket 연결 완료`);
       this.isConnected = true;
       this.reconnectAttempts = 0;
       this._startKeepAlive();
@@ -84,18 +92,18 @@ export class ElevenLabsClient {
         const message = JSON.parse(raw.toString());
         this._handleMessage(message);
       } catch (err) {
-        console.error('[ElevenLabs] 메시지 파싱 오류:', err.message);
+        console.error(`[ElevenLabs:${this.label}] 메시지 파싱 오류:`, err.message);
       }
     });
 
     this.ws.on('error', (err) => {
-      console.error('[ElevenLabs] WebSocket 오류:', err.message);
+      console.error(`[ElevenLabs:${this.label}] WebSocket 오류:`, err.message);
       this.onError(err);
     });
 
     this.ws.on('close', (code, reason) => {
       const reasonStr = reason ? reason.toString() : '';
-      console.log(`[ElevenLabs] WebSocket 종료 (code: ${code}${reasonStr ? ', reason: ' + reasonStr : ''})`);
+      console.log(`[ElevenLabs:${this.label}] WebSocket 종료 (code: ${code}${reasonStr ? ', reason: ' + reasonStr : ''})`);
       this.isConnected = false;
       this._stopKeepAlive();
 
@@ -105,10 +113,10 @@ export class ElevenLabsClient {
       if (code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.reconnectAttempts++;
         const delay = Math.min(5000 * this.reconnectAttempts, 30000);
-        console.log(`[ElevenLabs] ${delay / 1000}초 후 재연결 시도 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+        console.log(`[ElevenLabs:${this.label}] ${delay / 1000}초 후 재연결 시도 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
         this.reconnectTimer = setTimeout(() => this._reconnect(), delay);
       } else if (code !== 1000) {
-        console.error(`[ElevenLabs] 재연결 최대 횟수 초과 (code: ${code})`);
+        console.error(`[ElevenLabs:${this.label}] 재연결 최대 횟수 초과 (code: ${code})`);
         this.onError(new Error(`ElevenLabs WebSocket 재연결 실패 (code: ${code})`));
       }
     });
@@ -126,12 +134,12 @@ export class ElevenLabsClient {
         this.ws = null;
       }
 
-      console.log('[ElevenLabs] 재연결 시도...');
+      console.log(`[ElevenLabs:${this.label}] 재연결 시도...`);
       await this.initSession();
       this.connect();
-      console.log('[ElevenLabs] 재연결 성공');
+      console.log(`[ElevenLabs:${this.label}] 재연결 성공`);
     } catch (err) {
-      console.error('[ElevenLabs] 재연결 실패:', err.message);
+      console.error(`[ElevenLabs:${this.label}] 재연결 실패:`, err.message);
       this.onError(err);
     }
   }
@@ -175,14 +183,14 @@ export class ElevenLabsClient {
 
     switch (type) {
       case 'session_started': {
-        console.log(`[ElevenLabs] 세션 시작 확인: ${JSON.stringify(message)}`);
+        console.log(`[ElevenLabs:${this.label}] 세션 시작 확인: ${JSON.stringify(message)}`);
         break;
       }
 
       case 'partial_transcript': {
         // 부분 전사 — 로그 (디버깅용)
         if (message.text && message.text.trim().length > 0) {
-          console.log(`[ElevenLabs] 부분 전사: "${message.text.trim()}"`);
+          console.log(`[ElevenLabs:${this.label}] 부분 전사: "${message.text.trim()}"`);
         }
         break;
       }
@@ -234,13 +242,13 @@ export class ElevenLabsClient {
       case 'unaccepted_terms':
       case 'commit_throttled': {
         const errorMsg = message.error || message.message || type;
-        console.error(`[ElevenLabs] 서버 오류 (${type}):`, errorMsg);
+        console.error(`[ElevenLabs:${this.label}] 서버 오류 (${type}):`, errorMsg);
         this.onError(new Error(`ElevenLabs ${type}: ${errorMsg}`));
         break;
       }
 
       case 'session_time_limit_exceeded': {
-        console.warn('[ElevenLabs] 세션 시간 제한 초과, 새 세션으로 재연결...');
+        console.warn(`[ElevenLabs:${this.label}] 세션 시간 제한 초과, 새 세션으로 재연결...`);
         this.onError(new Error('ElevenLabs 세션 시간 초과'));
         // 자동 재연결
         if (!this.destroyed) {
@@ -250,7 +258,7 @@ export class ElevenLabsClient {
       }
 
       default:
-        console.log(`[ElevenLabs] 알 수 없는 메시지 타입: ${type}`, JSON.stringify(message).slice(0, 300));
+        console.log(`[ElevenLabs:${this.label}] 알 수 없는 메시지 타입: ${type}`, JSON.stringify(message).slice(0, 300));
         break;
     }
   }
@@ -267,8 +275,8 @@ export class ElevenLabsClient {
     // 오디오 전송 통계 (처음 10회만 로그)
     if (!this._sendCount) this._sendCount = 0;
     this._sendCount++;
-    if (this._sendCount <= 10 || this._sendCount % 100 === 0) {
-      console.log(`[ElevenLabs] 오디오 전송 #${this._sendCount}: ${audioBuffer.length} bytes`);
+    if (this._sendCount <= 5 || this._sendCount % 200 === 0) {
+      console.log(`[ElevenLabs:${this.label}] 오디오 전송 #${this._sendCount}: ${audioBuffer.length} bytes`);
     }
 
     // ElevenLabs는 JSON 메시지로 base64 인코딩된 오디오를 전송
@@ -287,11 +295,11 @@ export class ElevenLabsClient {
     this._stopKeepAlive();
 
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.warn('[ElevenLabs] WebSocket이 열려있지 않습니다.');
+      console.warn(`[ElevenLabs:${this.label}] WebSocket이 열려있지 않습니다.`);
       return Promise.resolve({ sessionId: this.sessionId });
     }
 
-    console.log('[ElevenLabs] 녹음 중단: 마지막 세그먼트 커밋 후 종료...');
+    console.log(`[ElevenLabs:${this.label}] 녹음 중단: 마지막 세그먼트 커밋 후 종료...`);
 
     return new Promise((resolve) => {
       let resolved = false;
@@ -304,7 +312,7 @@ export class ElevenLabsClient {
 
       if (this.ws) {
         this.ws.on('close', () => {
-          console.log('[ElevenLabs] WS 종료됨');
+          console.log(`[ElevenLabs:${this.label}] WS 종료됨`);
           done();
         });
       }
@@ -316,9 +324,9 @@ export class ElevenLabsClient {
           audio_base_64: Buffer.alloc(640, 0).toString('base64'),
           commit: true,
         }));
-        console.log('[ElevenLabs] 마지막 커밋 전송 완료');
+        console.log(`[ElevenLabs:${this.label}] 마지막 커밋 전송 완료`);
       } catch (err) {
-        console.warn('[ElevenLabs] 커밋 전송 실패:', err.message);
+        console.warn(`[ElevenLabs:${this.label}] 커밋 전송 실패:`, err.message);
       }
 
       // 커밋 응답 대기 후 종료 (2초 대기)
@@ -331,7 +339,7 @@ export class ElevenLabsClient {
       // 타임아웃 안전장치 (10초)
       setTimeout(() => {
         if (!resolved) {
-          console.warn('[ElevenLabs] stopRecording 타임아웃 (10초)');
+          console.warn(`[ElevenLabs:${this.label}] stopRecording 타임아웃 (10초)`);
           done();
         }
       }, 10000);
@@ -355,6 +363,6 @@ export class ElevenLabsClient {
     }
     this.isConnected = false;
     this.sessionId = null;
-    console.log('[ElevenLabs] 클라이언트 정리 완료');
+    console.log(`[ElevenLabs:${this.label}] 클라이언트 정리 완료`);
   }
 }

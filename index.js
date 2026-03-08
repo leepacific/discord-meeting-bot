@@ -65,7 +65,7 @@ async function startMeeting(interaction) {
 
   // try 블록 밖에 선언하여 catch에서도 접근 가능하도록 함
   let voiceHandler = null;
-  let sttClient = null;
+  let sttClients = new Map(); // userId → ElevenLabsClient
   let transcriptManager = null;
   let chatCollector = null;
 
@@ -78,23 +78,13 @@ async function startMeeting(interaction) {
     chatCollector = new ChatCollector(client);
     chatCollector.start(interaction.channel);
 
-    // ElevenLabs STT 클라이언트 초기화
-    sttClient = new ElevenLabsClient({
-      onTranscript: (data) => {
-        transcriptManager.addTranscript(data);
-      },
-      onError: (err) => {
-        console.error('[Main] STT 오류:', err.message);
-      },
-      onSessionEnd: (sessionId) => {
-        console.log(`[Main] STT 세션 종료: ${sessionId}`);
-      },
-    });
-
-    // Voice 핸들러 초기화
+    // Voice 핸들러 초기화 (유저별 오디오 콜백)
     voiceHandler = new VoiceHandler({
-      onAudioData: (audioBuffer) => {
-        sttClient.sendAudio(audioBuffer);
+      onUserAudioData: (userId, audioBuffer) => {
+        const userStt = sttClients.get(userId);
+        if (userStt) {
+          userStt.sendAudio(audioBuffer);
+        }
       },
       onUserJoin: async (userId, channel) => {
         try {
@@ -103,6 +93,33 @@ async function startMeeting(interaction) {
           const displayName = guildMember?.displayName || user.username;
           transcriptManager.setSpeakerName(channel, displayName);
           console.log(`[Main] 화자 등록: ${displayName} (채널 ${channel})`);
+
+          // 해당 유저 전용 ElevenLabs STT 세션 생성
+          if (!sttClients.has(userId)) {
+            const userStt = new ElevenLabsClient({
+              label: displayName,
+              onTranscript: (data) => {
+                // 해당 유저의 채널 번호로 화자 구분
+                transcriptManager.addTranscript({ ...data, channel });
+              },
+              onError: (err) => {
+                console.error(`[Main] STT 오류 (${displayName}):`, err.message);
+              },
+              onSessionEnd: (sessionId) => {
+                console.log(`[Main] STT 세션 종료 (${displayName}): ${sessionId}`);
+              },
+            });
+
+            try {
+              await userStt.initSession();
+              userStt.connect();
+              sttClients.set(userId, userStt);
+              console.log(`[Main] STT 세션 생성 완료: ${displayName} (userId: ${userId})`);
+            } catch (err) {
+              console.error(`[Main] STT 세션 생성 실패 (${displayName}):`, err.message);
+              try { userStt.destroy(); } catch {}
+            }
+          }
         } catch (err) {
           console.error(`[Main] 유저 정보 조회 실패:`, err.message);
           transcriptManager.setSpeakerName(channel, `유저_${channel}`);
@@ -110,6 +127,7 @@ async function startMeeting(interaction) {
       },
       onUserLeave: (userId) => {
         console.log(`[Main] 유저 퇴장: ${userId}`);
+        // 퇴장한 유저의 STT 세션은 유지 (재입장 대비, 종료 시 일괄 정리)
       },
       onForceDisconnect: () => {
         // 봇이 킥/강제퇴장된 경우 세션 정리
@@ -117,40 +135,17 @@ async function startMeeting(interaction) {
       },
     });
 
-    // 1. 음성 채널 접속과 STT 세션 초기화를 병렬로 실행
-    //    한쪽이 실패해도 양쪽 모두 정리되도록 처리
-    let voiceJoined = false;
-    let sttInited = false;
-
+    // 음성 채널 접속 (유저 입장 시 동적으로 STT 세션 생성됨)
     try {
-      const results = await Promise.allSettled([
-        voiceHandler.join(voiceChannel),
-        sttClient.initSession(),
-      ]);
-
-      if (results[0].status === 'rejected') {
-        throw new Error(`음성 채널 접속 실패: ${results[0].reason?.message || results[0].reason}`);
-      }
-      voiceJoined = true;
-
-      if (results[1].status === 'rejected') {
-        throw new Error(`STT 세션 초기화 실패: ${results[1].reason?.message || results[1].reason}`);
-      }
-      sttInited = true;
-    } catch (initErr) {
-      // 한쪽만 성공한 경우 성공한 쪽 정리
-      if (voiceJoined) try { voiceHandler.destroy(); } catch {}
-      if (sttInited) try { sttClient.destroy(); } catch {}
-      throw initErr;
+      await voiceHandler.join(voiceChannel);
+    } catch (err) {
+      throw new Error(`음성 채널 접속 실패: ${err.message}`);
     }
-
-    // 2. 양쪽 모두 성공하면 STT WebSocket 연결
-    sttClient.connect();
 
     // 세션 저장
     const session = {
       voiceHandler,
-      sttClient,
+      sttClients,
       transcriptManager,
       chatCollector,
       voiceChannel,
@@ -178,7 +173,10 @@ async function startMeeting(interaction) {
     console.error('[Main] 회의 시작 실패:', err);
     // 실패 시 모든 리소스 정리
     try { voiceHandler?.destroy(); } catch {}
-    try { sttClient?.destroy(); } catch {}
+    for (const [, userStt] of sttClients) {
+      try { userStt.destroy(); } catch {}
+    }
+    sttClients.clear();
     try { transcriptManager?.destroy(); } catch {}
     try { chatCollector?.destroy(); } catch {}
     activeSessions.delete(voiceChannel.id);
@@ -200,8 +198,13 @@ function handleForceDisconnect(channelId) {
   // 자동 종료 타이머가 있으면 제거
   clearAutoStopTimer(channelId);
 
-  // STT 정리
-  try { session.sttClient?.destroy(); } catch {}
+  // STT 정리 (모든 유저별 세션)
+  if (session.sttClients) {
+    for (const [, userStt] of session.sttClients) {
+      try { userStt.destroy(); } catch {}
+    }
+    session.sttClients.clear();
+  }
 
   // 전사 매니저 정리 (남은 버퍼 전송)
   try { session.transcriptManager?.destroy(); } catch {}
@@ -253,7 +256,11 @@ async function stopMeeting(interaction) {
     console.error('[Main] 회의 종료 실패:', err);
     // 강제 정리
     try { session.voiceHandler?.destroy(); } catch {}
-    try { session.sttClient?.destroy(); } catch {}
+    if (session.sttClients) {
+      for (const [, userStt] of session.sttClients) {
+        try { userStt.destroy(); } catch {}
+      }
+    }
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
     activeSessions.delete(session.voiceChannel.id);
@@ -269,8 +276,14 @@ async function performStopMeeting(session) {
   // 0. 먼저 세션을 맵에서 제거하여 중복 종료 및 voiceStateUpdate 간섭 방지
   activeSessions.delete(session.voiceChannel.id);
 
-  // 1. STT 녹음 중단
-  await session.sttClient.stopRecording();
+  // 1. 모든 유저별 STT 녹음 중단 (병렬)
+  const stopPromises = [];
+  for (const [, userStt] of session.sttClients) {
+    stopPromises.push(userStt.stopRecording().catch((err) => {
+      console.error('[Main] STT stopRecording 오류:', err.message);
+    }));
+  }
+  await Promise.all(stopPromises);
 
   // 2. 음성 스트림 중단
   session.voiceHandler.destroy();
@@ -308,8 +321,11 @@ async function performStopMeeting(session) {
     textChannel: session.textChannel,
   });
 
-  // 8. STT 정리
-  session.sttClient.destroy();
+  // 8. 모든 유저별 STT 정리
+  for (const [, userStt] of session.sttClients) {
+    try { userStt.destroy(); } catch {}
+  }
+  session.sttClients.clear();
 
   // 9. 세션 제거 (이미 0단계에서 제거됨, 안전을 위한 중복 호출)
   activeSessions.delete(session.voiceChannel.id);
@@ -421,7 +437,11 @@ function setAutoStopTimer(channelId) {
       console.error('[Main] 자동 종료 실패:', err);
       // 강제 정리
       try { session.voiceHandler?.destroy(); } catch {}
-      try { session.sttClient?.destroy(); } catch {}
+      if (session.sttClients) {
+        for (const [, userStt] of session.sttClients) {
+          try { userStt.destroy(); } catch {}
+        }
+      }
       try { session.transcriptManager?.destroy(); } catch {}
       try { session.chatCollector?.destroy(); } catch {}
       activeSessions.delete(channelId);
@@ -526,7 +546,11 @@ process.on('SIGINT', () => {
   for (const [channelId, session] of activeSessions) {
     clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
-    try { session.sttClient?.destroy(); } catch {}
+    if (session.sttClients) {
+      for (const [, userStt] of session.sttClients) {
+        try { userStt.destroy(); } catch {}
+      }
+    }
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
   }
@@ -540,7 +564,11 @@ process.on('SIGTERM', () => {
   for (const [channelId, session] of activeSessions) {
     clearAutoStopTimer(channelId);
     try { session.voiceHandler?.destroy(); } catch {}
-    try { session.sttClient?.destroy(); } catch {}
+    if (session.sttClients) {
+      for (const [, userStt] of session.sttClients) {
+        try { userStt.destroy(); } catch {}
+      }
+    }
     try { session.transcriptManager?.destroy(); } catch {}
     try { session.chatCollector?.destroy(); } catch {}
   }

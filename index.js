@@ -260,6 +260,9 @@ async function stopMeeting(interaction) {
  * 공통 회의 종료 로직 (수동 종료 + 자동 종료에서 공유)
  */
 async function performStopMeeting(session) {
+  // 0. 먼저 세션을 맵에서 제거하여 중복 종료 및 voiceStateUpdate 간섭 방지
+  activeSessions.delete(session.voiceChannel.id);
+
   // 1. 먼저 Gladia에 stop_recording 전송 (후처리 트리거)
   const stopResult = await session.gladiaClient.stopRecording();
 
@@ -285,6 +288,10 @@ async function performStopMeeting(session) {
         if (summaryData && summaryData.success && !summaryData.is_empty) {
           summary = summaryData;
           console.log('[Main] REST API로 요약 획득 성공');
+          break;
+        } else if (results?.status === 'done' && summaryData === null) {
+          // 세션 완료되었으나 요약이 null → 전사된 내용이 없어 요약 생성 불가
+          console.log('[Main] 전사 내용 없음, 요약 생성 불가 (REST 폴백 중단)');
           break;
         } else {
           console.log(`[Main] 요약 아직 준비 안됨 (attempt ${attempt}), status: ${results?.status}, summarization: ${JSON.stringify(summaryData?.success ?? null)}`);
@@ -313,7 +320,7 @@ async function performStopMeeting(session) {
   // 7. Gladia 정리
   session.gladiaClient.destroy();
 
-  // 8. 세션 제거
+  // 8. 세션 제거 (이미 0단계에서 제거됨, 안전을 위한 중복 호출)
   activeSessions.delete(session.voiceChannel.id);
 }
 
@@ -487,35 +494,32 @@ client.on('interactionCreate', async (interaction) => {
 
 // ── 음성 상태 변경 감지 (자동 종료용) ──
 client.on('voiceStateUpdate', (oldState, newState) => {
-  // 누군가 음성 채널을 나갔을 때만 체크
+  // 봇 자신의 이벤트는 무시 (destroy 시 voiceStateUpdate 발생 방지)
+  if (oldState.member?.user?.bot || newState.member?.user?.bot) return;
+
   const leftChannelId = oldState.channelId;
-  if (!leftChannelId) return;
-  if (leftChannelId === newState.channelId) return; // 같은 채널 내 변경 (뮤트 등) 무시
-
-  // 해당 채널에 활성 세션이 있는지 확인
-  if (!activeSessions.has(leftChannelId)) return;
-
-  // 채널에 남은 인원 확인 (봇 제외)
-  const channel = oldState.guild.channels.cache.get(leftChannelId);
-  if (!channel) return;
-
-  const humanMembers = channel.members.filter(m => !m.user.bot);
-  if (humanMembers.size === 0) {
-    // 봇만 남음 → 자동 종료 타이머 시작
-    setAutoStopTimer(leftChannelId);
-  }
-});
-
-// 누군가 음성 채널에 (재)입장하면 자동 종료 타이머 취소
-client.on('voiceStateUpdate', (oldState, newState) => {
   const joinedChannelId = newState.channelId;
-  if (!joinedChannelId) return;
-  if (joinedChannelId === oldState.channelId) return; // 같은 채널 내 변경 무시
 
-  // 해당 채널에 자동 종료 타이머가 설정되어 있으면 해제
-  if (autoStopTimers.has(joinedChannelId) && !newState.member?.user?.bot) {
-    console.log(`[Main] 참가자 입장으로 자동 종료 취소: ${joinedChannelId}`);
-    clearAutoStopTimer(joinedChannelId);
+  // 채널을 나간 경우: 자동 종료 채크
+  if (leftChannelId && leftChannelId !== joinedChannelId) {
+    if (activeSessions.has(leftChannelId)) {
+      const channel = oldState.guild.channels.cache.get(leftChannelId);
+      if (channel) {
+        const humanMembers = channel.members.filter(m => !m.user.bot);
+        if (humanMembers.size === 0) {
+          // 봇만 남음 → 자동 종료 타이머 시작
+          setAutoStopTimer(leftChannelId);
+        }
+      }
+    }
+  }
+
+  // 채널에 (재)입장한 경우: 자동 종료 타이머 취소
+  if (joinedChannelId && joinedChannelId !== leftChannelId) {
+    if (autoStopTimers.has(joinedChannelId)) {
+      console.log(`[Main] 참가자 입장으로 자동 종료 취소: ${joinedChannelId}`);
+      clearAutoStopTimer(joinedChannelId);
+    }
   }
 });
 

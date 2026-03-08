@@ -80,9 +80,13 @@ export class SummaryGenerator {
         inline: false,
       });
     } else {
+      // 전사된 발언이 없으면 요약 불가능 (정상 동작)
+      const noTranscriptMsg = stats.totalUtterances === 0
+        ? '_음성이 감지되지 않아 요약을 생성할 수 없습니다._'
+        : '_요약을 생성하지 못했습니다._';
       summaryEmbed.addFields({
         name: '📝 요약',
-        value: '_요약을 생성하지 못했습니다._',
+        value: noTranscriptMsg,
         inline: false,
       });
     }

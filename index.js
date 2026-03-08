@@ -289,8 +289,8 @@ async function performStopMeeting(session) {
           summary = summaryData;
           console.log('[Main] REST API로 요약 획득 성공');
           break;
-        } else if (results?.status === 'done' && summaryData === null) {
-          // 세션 완료되었으나 요약이 null → 전사된 내용이 없어 요약 생성 불가
+        } else if (results?.status === 'done' && !summaryData) {
+          // 세션 완료되었으나 요약이 null/undefined → 전사된 내용이 없어 요약 생성 불가
           console.log('[Main] 전사 내용 없음, 요약 생성 불가 (REST 폴백 중단)');
           break;
         } else {

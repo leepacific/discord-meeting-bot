@@ -61,6 +61,18 @@ async function startMeeting(interaction) {
     return;
   }
 
+  // 같은 서버(길드) 내 다른 음성 채널에서 이미 세션이 진행 중인지 확인
+  // Discord 제한: 봇 1개는 길드당 음성 채널 1개에만 접속 가능
+  const existingGuildSession = getGuildSessions(guild.id);
+  if (existingGuildSession.length > 0) {
+    const existingChannelName = existingGuildSession[0].voiceChannel.name;
+    await interaction.reply({
+      content: `⚠️ 이 서버에서 이미 **${existingChannelName}** 채널에서 회의가 진행 중입니다.\n봇은 서버당 하나의 음성 채널에만 접속할 수 있습니다. 먼저 \`/meeting-stop\`으로 기존 회의를 종료해주세요.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   await interaction.deferReply();
 
   // try 블록 밖에 선언하여 catch에서도 접근 가능하도록 함

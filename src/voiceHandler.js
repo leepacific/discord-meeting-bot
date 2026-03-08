@@ -185,19 +185,13 @@ export class VoiceHandler {
   /**
    * 무음 재생 — Discord의 오디오 수신 파이프라인 활성화
    * Discord는 봇이 무엇이라도 재생해야 오디오 수신이 정상 동작함
-   * 0.25초마다 무음 Opus 프레임을 생성하는 스트림을 재생
+   * setInterval로 250ms마다 무음 Opus 프레임을 지속적으로 공급
    */
   _startSilencePlayer() {
     if (!this.connection || this.destroyed) return;
 
-    // 기존 플레이어 정리 (재시작 시 이벤트 리스너 중복 방지)
-    if (this.silencePlayer) {
-      try {
-        this.silencePlayer.removeAllListeners();
-        this.silencePlayer.stop(true);
-      } catch {}
-      this.silencePlayer = null;
-    }
+    // 기존 플레이어 및 타이머 정리 (재시작 시 중복 방지)
+    this._stopSilencePlayer();
 
     try {
       this.silencePlayer = createAudioPlayer();
@@ -205,15 +199,27 @@ export class VoiceHandler {
       // 무음 Opus 프레임 (0xF8, 0xFF, 0xFE = Opus silence frame)
       const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
 
-      // 무한 무음 스트림 생성
+      // setInterval로 지속적으로 무음 프레임을 공급하는 Readable 스트림
+      // 기존 setTimeout 방식은 read()마다 1회만 push하여 버퍼가 즉시 비고
+      // AudioPlayer가 Idle로 전환 → 재시작 루프(0.5초)가 발생했음
       const silenceStream = new Readable({
-        read() {
-          // 250ms마다 무음 프레임 푸시 (배터리 절약)
-          setTimeout(() => {
-            this.push(SILENCE_FRAME);
-          }, 250);
-        },
+        read() {}, // setInterval이 push를 담당하므로 read()는 비워둠
       });
+
+      // 250ms 간격으로 무음 프레임 연속 공급
+      this._silenceInterval = setInterval(() => {
+        if (this.destroyed) {
+          clearInterval(this._silenceInterval);
+          this._silenceInterval = null;
+          return;
+        }
+        try {
+          // push가 false를 반환하면 backpressure — 다음 interval에서 재시도
+          silenceStream.push(SILENCE_FRAME);
+        } catch {
+          // 스트림이 이미 destroyed된 경우 무시
+        }
+      }, 250);
 
       const resource = createAudioResource(silenceStream, {
         inputType: StreamType.Opus,
@@ -222,7 +228,7 @@ export class VoiceHandler {
       this.silencePlayer.play(resource);
       this.connection.subscribe(this.silencePlayer);
 
-      // 에러/중단 시 자동 재시작 (무음 플레이어가 멈추면 오디오 수신이 중단됨)
+      // 에러 시 자동 재시작 (무음 플레이어가 멈추면 오디오 수신이 중단됨)
       this.silencePlayer.on('error', (err) => {
         console.warn('[Voice] 무음 플레이어 에러, 재시작:', err.message);
         if (!this.destroyed) {
@@ -230,11 +236,11 @@ export class VoiceHandler {
         }
       });
 
+      // Idle 전환 시 한 번만 재시작 (무한 루프 방지용 3초 딜레이)
       this.silencePlayer.on(AudioPlayerStatus.Idle, () => {
-        // 예기치 않게 재생이 멈춘 경우 재시작
         if (!this.destroyed) {
-          console.log('[Voice] 무음 플레이어 idle, 재시작...');
-          setTimeout(() => this._startSilencePlayer(), 500);
+          console.warn('[Voice] 무음 플레이어 예기치 않게 idle 전환, 3초 후 재시작');
+          setTimeout(() => this._startSilencePlayer(), 3000);
         }
       });
 
@@ -244,6 +250,21 @@ export class VoiceHandler {
       if (!this.destroyed) {
         setTimeout(() => this._startSilencePlayer(), 2000);
       }
+    }
+  }
+
+  /**
+   * 무음 플레이어 및 관련 타이머 정리
+   */
+  _stopSilencePlayer() {
+    if (this._silenceInterval) {
+      clearInterval(this._silenceInterval);
+      this._silenceInterval = null;
+    }
+    if (this.silencePlayer) {
+      try { this.silencePlayer.removeAllListeners(); } catch {}
+      try { this.silencePlayer.stop(true); } catch {}
+      this.silencePlayer = null;
     }
   }
 
@@ -401,6 +422,10 @@ export class VoiceHandler {
       clearTimeout(this.daveReadyTimer);
       this.daveReadyTimer = null;
     }
+    if (this._silenceInterval) {
+      clearInterval(this._silenceInterval);
+      this._silenceInterval = null;
+    }
   }
 
   /**
@@ -493,12 +518,8 @@ export class VoiceHandler {
     this._cleanupTimers();
     this._cleanupAllStreams();
 
-    // 무음 재생기 정리 (리스너 먼저 제거하여 Idle 핸들러 재시작 방지)
-    if (this.silencePlayer) {
-      try { this.silencePlayer.removeAllListeners(); } catch {}
-      try { this.silencePlayer.stop(true); } catch {}
-      this.silencePlayer = null;
-    }
+    // 무음 재생기 및 interval 정리
+    this._stopSilencePlayer();
 
     if (this.connection) {
       try { this.connection.destroy(); } catch {}

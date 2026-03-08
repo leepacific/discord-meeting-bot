@@ -165,6 +165,7 @@ export class ElevenLabsClient {
         this.ws.send(JSON.stringify({
           message_type: 'input_audio_chunk',
           audio_base_64: SILENCE_BASE64,
+          sample_rate: 16000,
         }));
       }
     }, 25000);
@@ -253,9 +254,11 @@ export class ElevenLabsClient {
       case 'session_time_limit_exceeded': {
         console.warn(`[ElevenLabs:${this.label}] 세션 시간 제한 초과, 새 세션으로 재연결...`);
         this.onError(new Error('ElevenLabs 세션 시간 초과'));
-        // 자동 재연결 — _reconnect에서 기존 WS 리스너를 제거하므로
-        // close 이벤트에 의한 중복 재연결이 발생하지 않음
+        // close 이벤트에 의한 중복 재연결 방지: 기존 WS 리스너를 먼저 제거
         if (!this.destroyed) {
+          if (this.ws) {
+            this.ws.removeAllListeners();
+          }
           this._reconnect();
         }
         break;
@@ -284,9 +287,11 @@ export class ElevenLabsClient {
     }
 
     // ElevenLabs는 JSON 메시지로 base64 인코딩된 오디오를 전송
+    // sample_rate를 명시적으로 포함 (공식 SDK 및 문서 권장사항)
     this.ws.send(JSON.stringify({
       message_type: 'input_audio_chunk',
       audio_base_64: audioBuffer.toString('base64'),
+      sample_rate: 16000,
     }));
     this.lastAudioSent = Date.now();
   }
@@ -315,7 +320,7 @@ export class ElevenLabsClient {
       };
 
       if (this.ws) {
-        this.ws.on('close', () => {
+        this.ws.once('close', () => {
           console.log(`[ElevenLabs:${this.label}] WS 종료됨`);
           done();
         });
@@ -326,6 +331,7 @@ export class ElevenLabsClient {
         this.ws.send(JSON.stringify({
           message_type: 'input_audio_chunk',
           audio_base_64: Buffer.alloc(640, 0).toString('base64'),
+          sample_rate: 16000,
           commit: true,
         }));
         console.log(`[ElevenLabs:${this.label}] 마지막 커밋 전송 완료`);

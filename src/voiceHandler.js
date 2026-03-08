@@ -3,8 +3,13 @@ import {
   VoiceConnectionStatus,
   entersState,
   EndBehaviorType,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  StreamType,
 } from '@discordjs/voice';
 import prism from 'prism-media';
+import { Readable } from 'stream';
 
 /**
  * 디스코드 음성 채널 핸들러
@@ -30,6 +35,13 @@ export class VoiceHandler {
     this.mixInterval = null;
     this.userBuffers = new Map();     // userId → [PCM 16kHz mono chunks]
     this.destroyed = false;
+
+    // 무음 재생용 AudioPlayer (오디오 수신 활성화에 필요)
+    this.silencePlayer = null;
+
+    // DAVE 핸드셰이크 완료 대기: speaking 이벤트 구독 지연
+    this.daveReady = false;
+    this.pendingSpeakers = new Set(); // DAVE 준비 전 speaking 감지된 유저
 
     // 메모리 관리: 비활성 유저 스트림 정리 타이머
     this.inactivityCleanupInterval = null;
@@ -125,13 +137,38 @@ export class VoiceHandler {
     // UDP 패킷 수신 모니터링 (기능 유지에 필요, 로그 주기만 60초로)
     this._monitorUdpPackets();
 
-    // 채널에 이미 있는 유저들을 미리 구독 (DAVE 키 교환 선행 완료 유도)
-    this._preSubscribeExistingUsers(voiceChannel);
+    // 무음 재생 시작 — Discord에서 오디오 수신을 활성화하려면
+    // 봇이 무엇이라도 재생해야 오디오 수신 파이프라인이 열림
+    this._startSilencePlayer();
 
-    // 유저 스피킹 이벤트 감지 → 오디오 구독 시작
+    // DAVE 핸드셰이크 완료 대기 (5초)
+    // 선행 구독을 제거하고, DAVE 키 교환이 완료된 후에만 유저를 구독
+    console.log('[Voice] DAVE 핸드셰이크 완료 대기 (5초)...');
+    this.daveReady = false;
+    this.daveReadyTimer = setTimeout(() => {
+      if (this.destroyed) return;
+      this.daveReady = true;
+      console.log(`[Voice] DAVE 준비 완료, 대기 중인 유저 ${this.pendingSpeakers.size}명 구독 시작`);
+      // DAVE 준비 전에 speaking을 감지한 유저들 구독
+      for (const userId of this.pendingSpeakers) {
+        if (!this.activeStreams.has(userId) && !this.destroyed) {
+          this._subscribeUser(userId);
+        }
+      }
+      this.pendingSpeakers.clear();
+    }, 5000);
+
+    // 유저 스피킹 이벤트 감지 → DAVE 준비되면 즉시 구독, 아니면 대기 목록에 추가
     this.connection.receiver.speaking.on('start', (userId) => {
-      if (!this.activeStreams.has(userId) && !this.destroyed) {
+      if (this.destroyed) return;
+      if (this.activeStreams.has(userId)) return;
+
+      if (this.daveReady) {
         this._subscribeUser(userId);
+      } else {
+        // DAVE 키 교환 완료 전이면 대기 목록에 추가
+        this.pendingSpeakers.add(userId);
+        console.log(`[Voice] DAVE 대기 중 — 유저 ${userId} 구독 지연`);
       }
     });
 
@@ -145,24 +182,39 @@ export class VoiceHandler {
   }
 
   /**
-   * 채널에 이미 존재하는 유저들을 미리 구독
-   * DAVE 키 교환이 speaking 이벤트 전에 완료되도록 유도하여
-   * 첫 발언 유실을 최소화
+   * 무음 재생 — Discord의 오디오 수신 파이프라인 활성화
+   * Discord는 봇이 무엇이라도 재생해야 오디오 수신이 정상 동작함
+   * 0.25초마다 무음 Opus 프레임을 생성하는 스트림을 재생
    */
-  _preSubscribeExistingUsers(voiceChannel) {
+  _startSilencePlayer() {
+    if (!this.connection) return;
+
     try {
-      const members = voiceChannel.members;
-      if (!members) return;
+      this.silencePlayer = createAudioPlayer();
 
-      for (const [userId, member] of members) {
-        if (member.user.bot) continue; // 봇 제외
-        if (this.activeStreams.has(userId)) continue; // 이미 구독 중
+      // 무음 Opus 프레임 (0xF8, 0xFF, 0xFE = Opus silence frame)
+      const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
 
-        console.log(`[Voice] 기존 유저 선행 구독: ${member.displayName} (${userId})`);
-        this._subscribeUser(userId);
-      }
+      // 무한 무음 스트림 생성
+      const silenceStream = new Readable({
+        read() {
+          // 250ms마다 무음 프레임 푸시 (배터리 절약)
+          setTimeout(() => {
+            this.push(SILENCE_FRAME);
+          }, 250);
+        },
+      });
+
+      const resource = createAudioResource(silenceStream, {
+        inputType: StreamType.Opus,
+      });
+
+      this.silencePlayer.play(resource);
+      this.connection.subscribe(this.silencePlayer);
+
+      console.log('[Voice] 무음 재생 시작 (오디오 수신 활성화)');
     } catch (err) {
-      console.log('[Voice] 선행 구독 실패 (무시):', err.message);
+      console.warn('[Voice] 무음 재생 실패 (무시):', err.message);
     }
   }
 
@@ -316,6 +368,10 @@ export class VoiceHandler {
       clearInterval(this.inactivityCleanupInterval);
       this.inactivityCleanupInterval = null;
     }
+    if (this.daveReadyTimer) {
+      clearTimeout(this.daveReadyTimer);
+      this.daveReadyTimer = null;
+    }
   }
 
   /**
@@ -407,6 +463,12 @@ export class VoiceHandler {
 
     this._cleanupTimers();
     this._cleanupAllStreams();
+
+    // 무음 재생기 정리
+    if (this.silencePlayer) {
+      try { this.silencePlayer.stop(true); } catch {}
+      this.silencePlayer = null;
+    }
 
     if (this.connection) {
       try { this.connection.destroy(); } catch {}

@@ -10,10 +10,13 @@ ElevenLabs Scribe v2 Realtime STT(Speech-to-Text) API를 활용한 디스코드 
 | 기능 | 설명 |
 |------|------|
 | 🎙️ 음성 전사 | 음성 채널 대화를 ElevenLabs Scribe v2로 실시간 전사 |
+| 👤 유저별 STT | 참여자마다 독립 ElevenLabs STT 세션으로 정확한 화자 구분 |
+| ⏰ 타임스탬프 정렬 | `words[0].start` 기반 실제 발화 시점으로 정확한 시간순 정렬 |
 | 💬 채팅 수집 | 텍스트 채널의 사람 메시지도 함께 수집 |
 | 📋 LLM 요약 | 회의 종료 시 OpenRouter(Claude) 기반 자동 요약 노트 생성 |
 | 📄 통합 회의록 | 음성 전사 + 채팅을 통합한 `.txt` 파일 첨부 |
 | 🔒 DAVE E2EE | Discord 암호화 음성(DAVE 프로토콜) 완전 지원 |
+| 🔄 자동 재연결 | STT WebSocket 끊김 시 자동 재연결 + 컨텍스트 유지 (previous_text) |
 | ⏹️ 자동 종료 | 봇만 남으면 2분 후 자동으로 회의 종료 |
 
 ---
@@ -98,13 +101,20 @@ ElevenLabs Scribe v2 Realtime STT(Speech-to-Text) API를 활용한 디스코드 
 
 ```
 📊 회의 기록 상태
+💡 음성 인식 중입니다. 발화가 끝나면 결과가 커밋됩니다.
+
 🎙️ 음성 채널: 일반 음성
 👤 시작자: username#1234
 ⏱️ 경과 시간: 15:30
 🗣️ 발언 수: 42건
+📝 부분 인식: 128회
+🔗 STT 연결: 3/3명
 👥 감지된 화자: 유저A, 유저B
 🌐 언어: ko
+🎙️ STT 상태: 유저A ✅, 유저B ✅, 유저C ✅
 ```
+
+커밋된 전사가 없어도 부분 인식 횟수와 STT 연결 상태로 정상 동작 여부를 확인할 수 있습니다.
 
 ### 회의 종료하기
 
@@ -237,11 +247,10 @@ discord-meeting-bot/
     ├── config.js               # 환경변수 로드 및 ElevenLabs/OpenRouter 설정
     ├── voiceHandler.js          # Discord 음성 채널 접속, Opus→PCM 변환, DAVE E2EE
     ├── elevenlabsClient.js      # ElevenLabs Scribe v2 Realtime WebSocket STT 클라이언트
-    ├── transcriptManager.js     # 전사 결과 관리, 통계 집계 (채팅 출력 비활성화)
+    ├── transcriptManager.js     # 전사 결과 관리, 통계 집계, 타임스탬프 정렬
     ├── chatCollector.js         # 텍스트 채널 채팅 수집기
     ├── llmSummarizer.js         # OpenRouter LLM 회의 요약 생성기
-    ├── summaryGenerator.js      # 통합 요약 임베드 + 회의록 파일 생성
-    └── gladiaClient.js          # (레거시) 이전 Gladia STT 클라이언트 — 사용하지 않음
+    └── summaryGenerator.js      # 통합 요약 임베드 + 회의록 파일 생성
 ```
 
 ---
@@ -257,23 +266,25 @@ Discord 음성 채널 (Opus 48kHz stereo, DAVE E2EE)
   ├─ Opus → PCM 디코딩 (opusscript + prism-media)
   ├─ 48kHz stereo → 16kHz mono 다운샘플링
   ├─ 유저별 SSRC → 화자 구분
-  └─ 100ms 간격으로 모노 믹스다운 후 전송
+  └─ 유저별 독립 PCM 스트림 전송
         │
-        ▼  PCM 16kHz mono (base64 JSON)
-  elevenlabsClient.js
+        ▼  유저별 PCM 16kHz mono (base64 JSON)
+  elevenlabsClient.js (유저당 1개 세션)
   ├─ WebSocket: wss://api.elevenlabs.io/v1/speech-to-text/realtime
   ├─ 인증: xi-api-key 헤더
   ├─ 오디오: {"message_type":"input_audio_chunk","audio_base_64":"..."}
-  ├─ VAD 기반 자동 커밋 (무음 1.0초 → committed_transcript 수신)
+  ├─ VAD 기반 자동 커밋 (무음 1.5초 → committed_transcript_with_timestamps 수신)
+  ├─ 타임스탬프: words[0].start + sttOffset으로 회의 기준 경과 시간 계산
+  ├─ 자동 재연결: 끊김 시 새 세션 + previous_text로 컨텍스트 유지
   ├─ Keep-alive: 25초 무활동 시 무음 패킷 전송
   └─ 종료: commit:true 플러시 → 2초 대기 → ws.close(1000)
         │
-        ▼  committed_transcript
+        ▼  committed_transcript_with_timestamps
   transcriptManager.js
-  ├─ 전사 결과 축적 (entries 배열)
+  ├─ 전사 결과 축적 (entries 배열) + 부분 전사 카운트
   ├─ 화자별 이름 매핑 (Discord 닉네임)
-  ├─ 실시간 채팅 출력: 비활성화 (서버 로그에만 기록)
-  └─ 통계 집계 (발언 수, 화자, 경과시간)
+  ├─ start(경과 시간) 기준 시간순 정렬
+  └─ 통계 집계 (발언 수, 부분 인식 횟수, STT 연결 상태, 화자, 경과시간)
         │
         ▼  회의 종료 (/meeting-stop)
   chatCollector.js → 텍스트 채팅 수집 결과 반환
@@ -294,8 +305,10 @@ Discord 음성 채널 (Opus 48kHz stereo, DAVE E2EE)
 | `modelId` | `scribe_v2_realtime` | ElevenLabs STT 모델 |
 | `languageCode` | `ko` | 인식 언어 (제거하면 자동 감지) |
 | `commitStrategy` | `vad` | 음성 구간 자동 감지로 전사 커밋 |
-| `vadSilenceThresholdSecs` | `1.0` | 무음 감지 후 커밋까지 대기 시간 (초) |
+| `vadSilenceThresholdSecs` | `1.5` | 무음 감지 후 커밋까지 대기 시간 (초) |
 | `vadThreshold` | `0.4` | VAD 감도 (0.0~1.0, 낮을수록 민감) |
+| `minSpeechDurationMs` | `150` | 최소 발화 길이 ms (잡음 오인식 방지) |
+| `minSilenceDurationMs` | `200` | 최소 무음 길이 ms (문장 중간 끊김 방지) |
 
 ### ElevenLabs WebSocket 프로토콜 요약
 
@@ -306,7 +319,8 @@ Discord 음성 채널 (Opus 48kHz stereo, DAVE E2EE)
 - **수신 메시지 타입** (`message_type` 필드):
   - `session_started` — 세션 연결 확인
   - `partial_transcript` — 부분 전사 (확정 전)
-  - `committed_transcript` — 확정된 전사 결과
+  - `committed_transcript` — 확정된 전사 결과 (폴백용)
+  - `committed_transcript_with_timestamps` — 단어별 타임스탬프 포함 확정 전사 (우선 사용)
   - `auth_error`, `quota_exceeded`, `rate_limited` 등 — 오류
 - **종료 절차**: `commit:true` 포함 청크 전송 → 2초 대기 → `ws.close(1000)`
 - **Keep-alive**: 25초 무활동 시 무음 패킷 전송 (연결 유지)
@@ -321,7 +335,7 @@ Discord 음성 채널 (Opus 48kHz stereo, DAVE E2EE)
 | ElevenLabs 비용 | STT Scribe v2 Realtime: $0.28/시간 |
 | OpenRouter 비용 | LLM 요약 생성 시 토큰 사용량에 따라 과금 |
 | Railway 비용 | Worker 서비스 상시 실행으로 크레딧 소모 |
-| 동시 회의 | 서버(길드)당 여러 음성 채널 동시 기록 가능 |
+| 동시 회의 | 서버(길드)당 음성 채널 1개에서 기록 (보트는 길드당 1개 채널만 접속 가능) |
 | 언어 | 기본 한국어 (`ko`), config에서 변경 가능 |
 | 봇 권한 | 음성 채널 Connect + 텍스트 채널 Send Messages 필수 |
 | DAVE E2EE | Discord 암호화 음성 프로토콜 지원 (`@snazzah/davey`) |
@@ -347,7 +361,7 @@ Discord 음성 채널 (Opus 48kHz stereo, DAVE E2EE)
 - Railway 로그에서 `[LLM] OpenRouter 요약 요청 중...` 메시지 확인
 
 ### VAD가 너무 빨리/느리게 커밋해요
-- `src/config.js`에서 `vadSilenceThresholdSecs` 값을 조절 (기본 1.0초)
+- `src/config.js`에서 `vadSilenceThresholdSecs` 값을 조절 (기본 1.5초)
 - 값을 높이면 더 긴 무음 후에 커밋, 낮추면 빠르게 커밋
 
 ### 슬래시 커맨드가 안 보여요

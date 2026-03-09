@@ -12,6 +12,7 @@ export class TranscriptManager {
     this.messageBuffer = [];  // 메시지 배치 전송용 버퍼
     this.flushTimer = null;
     this.startTime = null;
+    this.partialCount = 0;    // 부분 전사 수신 횟수 (status용)
   }
 
   /**
@@ -123,6 +124,13 @@ export class TranscriptManager {
   }
 
   /**
+   * 부분 전사 수신 카운트 (status 표시용)
+   */
+  incrementPartial() {
+    this.partialCount++;
+  }
+
+  /**
    * 전사 통계 반환
    */
   getStats() {
@@ -132,6 +140,7 @@ export class TranscriptManager {
 
     return {
       totalUtterances: this.entries.length,
+      partialCount: this.partialCount,
       speakers,
       speakerCount: speakers.length,
       languages,

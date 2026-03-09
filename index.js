@@ -118,6 +118,9 @@ async function startMeeting(interaction) {
                 // 해당 유저의 채널 번호로 화자 구분
                 transcriptManager.addTranscript({ ...data, channel });
               },
+              onPartialTranscript: () => {
+                transcriptManager.incrementPartial();
+              },
               onError: (err) => {
                 console.error(`[Main] STT 오류 (${displayName}):`, err.message);
               },
@@ -379,6 +382,27 @@ async function checkStatus(interaction) {
   }
 
   const stats = session.transcriptManager.getStats();
+
+  // STT 세션별 연결 상태 확인
+  const sttStatusList = [];
+  let activeConnections = 0;
+  if (session.sttClients) {
+    for (const [, userStt] of session.sttClients) {
+      const status = userStt.isConnected ? '✅' : '❌';
+      if (userStt.isConnected) activeConnections++;
+      sttStatusList.push(`${userStt.label} ${status}`);
+    }
+  }
+  const sttStatusText = sttStatusList.length > 0 ? sttStatusList.join(', ') : '없음';
+
+  // 상태 요약 텍스트 (커밋 전 부분 인식 중이면 안내)
+  let statusDescription = '';
+  if (stats.totalUtterances === 0 && stats.partialCount > 0) {
+    statusDescription = '💡 음성 인식 중입니다. 발화가 끝나면 결과가 커밋됩니다.';
+  } else if (stats.totalUtterances === 0 && stats.partialCount === 0 && activeConnections > 0) {
+    statusDescription = '💡 STT 연결 완료. 음성 대기 중...';
+  }
+
   const embed = new EmbedBuilder()
     .setTitle('📊 회의 기록 상태')
     .setColor(0x5865F2)
@@ -387,10 +411,17 @@ async function checkStatus(interaction) {
       { name: '👤 시작자', value: session.startedBy, inline: true },
       { name: '⏱️ 경과 시간', value: stats.durationFormatted, inline: true },
       { name: '🗣️ 발언 수', value: `${stats.totalUtterances}건`, inline: true },
+      { name: '📝 부분 인식', value: `${stats.partialCount}회`, inline: true },
+      { name: '🔗 STT 연결', value: `${activeConnections}/${sttStatusList.length}명`, inline: true },
       { name: '👥 감지된 화자', value: stats.speakers.join(', ') || '없음', inline: true },
-      { name: '🌐 언어', value: stats.languages.join(', ') || '감지 전', inline: true }
+      { name: '🌐 언어', value: stats.languages.join(', ') || '감지 전', inline: true },
+      { name: '🎙️ STT 상태', value: sttStatusText, inline: false }
     )
     .setTimestamp();
+
+  if (statusDescription) {
+    embed.setDescription(statusDescription);
+  }
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

@@ -18,10 +18,11 @@ export class ElevenLabsClient {
    * @param {Function} opts.onSessionEnd - 세션 종료 콜백
    * @param {string}   [opts.label] - 로그 식별자 (예: 유저 이름)
    */
-  constructor({ onTranscript, onError, onSessionEnd, label, meetingStartTime }) {
+  constructor({ onTranscript, onError, onSessionEnd, onPartialTranscript, label, meetingStartTime }) {
     this.onTranscript = onTranscript || (() => {});
     this.onError = onError || (() => {});
     this.onSessionEnd = onSessionEnd || (() => {});
+    this.onPartialTranscript = onPartialTranscript || (() => {});
     this.label = label || 'default';
     // 회의 시작 시점 (모든 유저가 동일한 기준점 사용)
     this.meetingStartTime = meetingStartTime || Date.now();
@@ -220,9 +221,10 @@ export class ElevenLabsClient {
       }
 
       case 'partial_transcript': {
-        // 부분 전사 — 로그 (디버깅용)
+        // 부분 전사 — 로그 + status용 카운트
         if (message.text && message.text.trim().length > 0) {
           console.log(`[ElevenLabs:${this.label}] 부분 전사: "${message.text.trim()}"`);
+          this.onPartialTranscript();
         }
         break;
       }
